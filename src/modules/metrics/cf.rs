@@ -14,6 +14,8 @@ pub type CFMutableDictionaryRef = *mut c_void;
 pub type CFArrayRef = *const c_void;
 pub type CFNumberRef = *const c_void;
 pub type CFDataRef = *const c_void;
+pub type CFURLRef = *const c_void;
+pub type CFErrorRef = *const c_void;
 pub type CFIndex = isize;
 pub type CFTypeID = usize;
 pub type CFStringEncoding = u32;
@@ -110,6 +112,21 @@ unsafe extern "C" {
 
     pub fn CFDataGetLength(data: CFDataRef) -> CFIndex;
     pub fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
+
+    pub static kCFURLVolumeNameKey: CFStringRef;
+
+    pub fn CFURLCreateFromFileSystemRepresentation(
+        alloc: CFAllocatorRef,
+        buffer: *const u8,
+        buf_len: CFIndex,
+        is_directory: u8,
+    ) -> CFURLRef;
+    pub fn CFURLCopyResourcePropertyForKey(
+        url: CFURLRef,
+        key: CFStringRef,
+        value: *mut c_void,
+        error: *mut CFErrorRef,
+    ) -> u8;
 }
 
 impl CFType {
@@ -236,6 +253,33 @@ pub fn data_bytes(cf: &CFType) -> Option<&[u8]> {
         let ptr = CFDataGetBytePtr(cf);
         (!ptr.is_null()).then(|| std::slice::from_raw_parts(ptr, len))
     }
+}
+
+/// The name of the volume mounted at `mount_point`, as the user named it.
+pub fn volume_name(mount_point: &str) -> Option<String> {
+    let len = CFIndex::try_from(mount_point.len()).ok()?;
+    // A `Create` call hands back a +1 reference.
+    let url = unsafe {
+        CFOwned::new(CFURLCreateFromFileSystemRepresentation(
+            kCFAllocatorDefault,
+            mount_point.as_ptr(),
+            len,
+            1,
+        ))
+    }?;
+    let mut name: CFTypeRef = std::ptr::null();
+    // A `Copy` call hands back a +1 reference in `name`, or leaves it null.
+    let read = unsafe {
+        CFURLCopyResourcePropertyForKey(
+            url.as_ptr(),
+            kCFURLVolumeNameKey,
+            (&mut name as *mut CFTypeRef).cast(),
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    // Owned before `read` is checked, so a value handed back anyway is released.
+    let name = unsafe { CFOwned::new(name) }?;
+    read.then(|| string(&name)).flatten()
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -488,6 +532,11 @@ mod tests {
     fn data_bytes_reads_an_owned_cfdata() {
         let data = cf_data(b"gpu");
         assert_eq!(data_bytes(&data), Some(&b"gpu"[..]));
+    }
+
+    #[test]
+    fn volume_name_reads_the_startup_volume() {
+        assert!(volume_name("/").is_some_and(|name| !name.is_empty()));
     }
 
     #[test]

@@ -422,8 +422,41 @@ unsafe extern "C" {
     /// Thread-safe `getmntinfo`: the buffer belongs to the caller, who frees it.
     /// On x86_64 the plain symbol returns the old, smaller `statfs`.
     #[cfg_attr(target_arch = "x86_64", link_name = "getmntinfo_r_np$INODE64")]
-    pub fn getmntinfo_r_np(mntbufp: *mut *mut statfs, flags: c_int) -> c_int;
-    pub fn free(ptr: *mut c_void);
+    fn getmntinfo_r_np(mntbufp: *mut *mut statfs, flags: c_int) -> c_int;
+    fn free(ptr: *mut c_void);
+}
+
+/// The kernel's mount table, freed on drop.
+pub struct MountTable {
+    entries: ptr::NonNull<statfs>,
+    count: usize,
+}
+
+impl MountTable {
+    /// `None` when the table can't be read. `MNT_NOWAIT` takes each
+    /// filesystem's cached sizes, so an unresponsive network mount can't stall
+    /// the read.
+    pub fn read() -> Option<Self> {
+        let mut entries: *mut statfs = ptr::null_mut();
+        let count = unsafe { getmntinfo_r_np(&mut entries, MNT_NOWAIT) };
+        let count = usize::try_from(count).ok().filter(|&count| count > 0)?;
+        Some(Self {
+            entries: ptr::NonNull::new(entries)?,
+            count,
+        })
+    }
+
+    pub fn entries(&self) -> &[statfs] {
+        // `getmntinfo_r_np` filled `count` entries, which live until drop.
+        unsafe { std::slice::from_raw_parts(self.entries.as_ptr(), self.count) }
+    }
+}
+
+impl Drop for MountTable {
+    fn drop(&mut self) {
+        // `getmntinfo_r_np` mallocs the buffer and hands it to us.
+        unsafe { free(self.entries.as_ptr().cast()) };
+    }
 }
 
 /// Converts a fixed, NUL-padded C array to a `String`.
@@ -502,14 +535,12 @@ mod tests {
 
     #[test]
     fn mount_table_entries_read_back_as_mount_paths() {
-        let mut mounts: *mut statfs = ptr::null_mut();
-        let count = unsafe { getmntinfo_r_np(&mut mounts, MNT_NOWAIT) };
-        assert!(count > 0 && !mounts.is_null(), "getmntinfo_r_np failed");
-        let paths: Vec<String> = unsafe { std::slice::from_raw_parts(mounts, count as usize) }
+        let table = MountTable::read().expect("getmntinfo_r_np failed");
+        let paths: Vec<String> = table
+            .entries()
             .iter()
             .map(|mount| c_array_to_string(&mount.f_mntonname))
             .collect();
-        unsafe { free(mounts.cast()) };
         // A wrong `statfs` layout lands these reads mid-entry, off the paths.
         assert!(paths.iter().any(|path| path == "/"), "{paths:?}");
         assert!(paths.iter().all(|path| path.starts_with('/')), "{paths:?}");

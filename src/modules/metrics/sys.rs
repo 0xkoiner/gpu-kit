@@ -60,6 +60,8 @@ pub struct mach_timebase_info {
 
 unsafe extern "C" {
     pub static mach_task_self_: mach_port_t;
+    /// `vm_size_t` from <mach/vm_page_size.h>: the unit of the kernel's page counts.
+    pub static vm_kernel_page_size: usize;
     pub fn mach_host_self() -> mach_port_t;
     pub fn host_processor_info(
         host: mach_port_t,

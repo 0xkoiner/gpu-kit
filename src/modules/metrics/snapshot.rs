@@ -225,7 +225,8 @@ pub struct Snapshot {
     /// `None` when /proc/meminfo can't be read.
     pub memory: Option<Memory>,
     /// `read` is received, `write` is sent. `None` on the first sample, which
-    /// only sets the baseline, and when the interface counters can't be read.
+    /// only sets the baseline, when the interface counters can't be read, and
+    /// when no interface carries its own traffic.
     pub network: Option<Throughput>,
     /// `None` on the first sample, which only sets the baseline, and when no
     /// physical disk's counters can be read.

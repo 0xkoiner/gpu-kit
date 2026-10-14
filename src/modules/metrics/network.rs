@@ -23,7 +23,8 @@ pub struct NetworkCounters {
 
 impl NetworkCounters {
     /// `read` is received bytes per second, `write` is sent. `None` on the
-    /// first call, which only sets the baseline, and when the read fails.
+    /// first call, which only sets the baseline, when the read fails, and
+    /// when no interface carries its own traffic.
     pub fn sample(&mut self) -> Option<Throughput> {
         self.rates.sample(Instant::now(), read_interfaces())
     }
@@ -31,9 +32,12 @@ impl NetworkCounters {
 
 /// Counters of each interface by name, so interfaces coming and going (USB
 /// adapters, containers' veth ends) don't net against the others' traffic.
+/// `None` when /proc/net/dev can't be read, and when no interface carries
+/// its own traffic, so a rate of zero is a quiet network, not a missing one.
 fn read_interfaces() -> Option<HashMap<String, ByteCounts>> {
     let counts = parse_counts(&files::read("/proc/net/dev")?);
-    Some(own_traffic(counts, |name| describe(Path::new(NET), name)))
+    let interfaces = own_traffic(counts, |name| describe(Path::new(NET), name));
+    (!interfaces.is_empty()).then_some(interfaces)
 }
 
 /// `(name, counts)` of every interface in /proc/net/dev, whose two header

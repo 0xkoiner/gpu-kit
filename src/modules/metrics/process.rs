@@ -193,9 +193,15 @@ fn command(pid: i32, comm: &str) -> String {
         .unwrap_or_else(|| comm.to_owned())
 }
 
-/// The file name of the first NUL-separated argument.
+/// The file name of the first NUL-separated argument. `None` when there is
+/// none, or it holds a space: a program's path rarely does, while a title a
+/// program wrote over its arguments (`sshd-session: me@pts/0`, `postgres:
+/// writer process`) does, and names the program worse than its `comm`.
 fn command_name(cmdline: &[u8]) -> Option<String> {
     let first = cmdline.split(|&byte| byte == 0).next()?;
+    if first.contains(&b' ') {
+        return None;
+    }
     let name = first.rsplit(|&byte| byte == b'/').next()?;
     (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned())
 }
@@ -321,7 +327,11 @@ mod tests {
             command_name(b"/usr/bin/python3\0-m\0http.server\0").as_deref(),
             Some("python3")
         );
-        assert_eq!(command_name(b"sshd: me@pts/0\0").as_deref(), Some("0"));
+        assert_eq!(
+            command_name(b"@dbus-daemon\0--system\0").as_deref(),
+            Some("@dbus-daemon")
+        );
+        assert_eq!(command_name(b"sshd: me@pts/0\0"), None, "a rewritten title");
         assert_eq!(command_name(b""), None, "a kernel thread");
     }
 

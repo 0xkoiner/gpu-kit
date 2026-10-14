@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::snapshot::Volume;
@@ -24,8 +25,7 @@ pub fn read() -> Option<Vec<Volume>> {
             let (total, available) = sizes(&mount.mount_point)?;
             // A device at two mount points (a bind mount) is listed once; checked
             // last, so a mount left out above can't hide the one that counts.
-            let device =
-                fs::canonicalize(&mount.source).unwrap_or_else(|_| PathBuf::from(&mount.source));
+            let device = device_of(&mount);
             if total == 0 || !seen_devices.insert(device.clone()) {
                 return None;
             }
@@ -123,6 +123,32 @@ fn sizes(mount_point: &str) -> Option<(u64, u64)> {
     ))
 }
 
+/// The block device a mount is on: its source resolved through any symlink
+/// (`/dev/disk/by-uuid/...`), or where the source is a name the kernel made
+/// up, as the `/dev/root` Ubuntu's cloud images mount the root as, the node
+/// under /dev/block that the mount point's device number names. Failing both,
+/// the source as written.
+fn device_of(mount: &Mount) -> PathBuf {
+    fs::canonicalize(&mount.source)
+        .ok()
+        .or_else(|| {
+            let dev = fs::metadata(&mount.mount_point).ok()?.dev();
+            fs::canonicalize(format!("/dev/block/{}:{}", major(dev), minor(dev))).ok()
+        })
+        .unwrap_or_else(|| PathBuf::from(&mount.source))
+}
+
+/// glibc's `gnu_dev_major` and `gnu_dev_minor`: how a `dev_t` packs the two,
+/// each number's low bits in the low word and its high bits above bit 32,
+/// which the casts to 32 bits keep apart.
+fn major(dev: u64) -> u64 {
+    ((dev >> 8) & 0xfff) | u64::from((dev >> 32) as u32 & !0xfff)
+}
+
+fn minor(dev: u64) -> u64 {
+    (dev & 0xff) | u64::from((dev >> 12) as u32 & !0xff)
+}
+
 /// Filesystem labels by the device they're on, from udev's links under
 /// /dev/disk/by-label, whose names write awkward bytes as `\xHH`.
 fn labels(by_label: &Path) -> HashMap<PathBuf, String> {
@@ -212,6 +238,37 @@ server:/export /mnt/nfs nfs4 rw 0 0
     fn unlabelled_volumes_go_by_their_folder() {
         assert_eq!(name_of("/"), "/");
         assert_eq!(name_of("/media/me/My Disk"), "My Disk");
+    }
+
+    #[test]
+    fn device_numbers_unpack_as_glibc_packs_them() {
+        // nvme0n1p1 is 259:1; a minor past 255 spills into the high bits.
+        assert_eq!((major(66305), minor(66305)), (259, 1));
+        assert_eq!(
+            (major(0x0000_1000_0000_0300), minor(0x0000_1000_0000_0300)),
+            (4099, 0)
+        );
+        assert_eq!(
+            (major(0x0000_0000_0010_0000), minor(0x0000_0000_0010_0000)),
+            (0, 256)
+        );
+    }
+
+    #[test]
+    fn a_made_up_source_resolves_through_the_mount_point() {
+        let root = Mount {
+            source: "/dev/root".to_owned(),
+            mount_point: "/".to_owned(),
+        };
+        let device = device_of(&root);
+        // Without udev's /dev/block links (a container) the source stays as written.
+        assert!(
+            device == Path::new("/dev/root") || device.starts_with("/dev/"),
+            "{device:?}"
+        );
+        if Path::new("/dev/block").exists() {
+            assert_ne!(device, Path::new("/dev/root"));
+        }
     }
 
     #[test]

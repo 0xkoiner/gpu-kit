@@ -44,6 +44,9 @@ pub type io_connect_t = u32;
 pub type IOOptionBits = u32;
 
 pub const kIOMainPortDefault: u32 = 0;
+pub const kIOServicePlane: &CStr = c"IOService";
+pub const kIORegistryIterateRecursively: IOOptionBits = 1;
+pub const kIORegistryIterateParents: IOOptionBits = 2;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -259,6 +262,15 @@ unsafe extern "C" {
         allocator: CFAllocatorRef,
         options: IOOptionBits,
     ) -> CFTypeRef;
+    pub fn IORegistryEntrySearchCFProperty(
+        entry: io_registry_entry_t,
+        plane: *const c_char,
+        key: CFStringRef,
+        allocator: CFAllocatorRef,
+        options: IOOptionBits,
+    ) -> CFTypeRef;
+    pub fn IORegistryEntryGetRegistryEntryID(entry: io_registry_entry_t, entry_id: *mut u64)
+    -> i32;
     pub fn IORegistryEntryGetName(entry: io_registry_entry_t, name: *mut c_char) -> i32;
     pub fn IORegistryEntryGetChildIterator(
         entry: io_registry_entry_t,
@@ -282,10 +294,11 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// Calls `visit` with every registry entry of class `class`. Entries are
-/// released after the call; read only the properties you need with
-/// [`property`], because copying a whole property table is costly.
-pub fn for_each_service(class: &str, visit: impl FnMut(io_object_t)) {
+/// Calls `visit` with every registry entry of class `class`, and returns
+/// whether the registry could be searched at all. Entries are released after
+/// the call; read only the properties you need with [`property`], because
+/// copying a whole property table is costly.
+pub fn for_each_service(class: &str, visit: impl FnMut(io_object_t)) -> bool {
     let class = CString::new(class).expect("class without NUL");
     let mut iter: io_iterator_t = 0;
     unsafe {
@@ -294,17 +307,18 @@ pub fn for_each_service(class: &str, visit: impl FnMut(io_object_t)) {
         if matching.is_null()
             || IOServiceGetMatchingServices(kIOMainPortDefault, matching, &mut iter) != 0
         {
-            return;
+            return false;
         }
         visit_iterator(iter, visit);
     }
+    true
 }
 
 /// Calls `visit` with each child of `entry` in the service plane.
 pub fn for_each_child(entry: io_registry_entry_t, visit: impl FnMut(io_object_t)) {
     let mut iter: io_iterator_t = 0;
     unsafe {
-        if IORegistryEntryGetChildIterator(entry, c"IOService".as_ptr(), &mut iter) != 0 {
+        if IORegistryEntryGetChildIterator(entry, kIOServicePlane.as_ptr(), &mut iter) != 0 {
             return;
         }
         visit_iterator(iter, visit);
@@ -338,6 +352,28 @@ pub fn property(entry: io_registry_entry_t, key: &str) -> Option<CFOwned> {
             0,
         ))
     }
+}
+
+/// Property `key` of `entry` or, failing that, of the first ancestor in the
+/// service plane that has it.
+pub fn inherited_property(entry: io_registry_entry_t, key: &str) -> Option<CFOwned> {
+    let key = CFOwned::string(key);
+    // A `Search` call hands back a +1 reference, as `Create` does.
+    unsafe {
+        CFOwned::new(IORegistryEntrySearchCFProperty(
+            entry,
+            kIOServicePlane.as_ptr(),
+            key.as_ptr(),
+            kCFAllocatorDefault,
+            kIORegistryIterateRecursively | kIORegistryIterateParents,
+        ))
+    }
+}
+
+/// The registry's ID for `entry`, which no other entry takes until reboot.
+pub fn registry_id(entry: io_registry_entry_t) -> Option<u64> {
+    let mut id = 0;
+    (unsafe { IORegistryEntryGetRegistryEntryID(entry, &mut id) } == 0).then_some(id)
 }
 
 /// Iterates the items of a CFArray, borrowed from `array`; yields nothing for

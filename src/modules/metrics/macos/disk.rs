@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::cf;
+use super::cf;
 use crate::rate::{ByteCounts, ByteRates};
 use crate::snapshot::Throughput;
 

@@ -1,5 +1,5 @@
-use crate::snapshot::{CoreKind, CoreTier, CoreUsage};
-use crate::sys;
+use super::sys;
+use crate::snapshot::{CoreKind, CoreTier};
 
 /// Per-core tick counters; usage is the busy share of the delta between reads.
 #[derive(Default)]
@@ -71,21 +71,6 @@ pub fn core_tiers() -> Vec<CoreTier> {
         })
         .collect::<Option<_>>()
         .unwrap_or_default()
-}
-
-/// Labels logical CPUs by the tier each falls in, `tiers` being in logical
-/// CPU order as [`core_tiers`] returns them. Cores no tier covers, as on
-/// Intel Macs, count as Performance.
-pub fn label_cores(usage: &[f32], tiers: &[CoreTier]) -> Vec<CoreUsage> {
-    let kinds = tiers
-        .iter()
-        .flat_map(|tier| std::iter::repeat_n(tier.kind, tier.cores as usize))
-        .chain(std::iter::repeat(CoreKind::Performance));
-    usage
-        .iter()
-        .zip(kinds)
-        .map(|(&usage, kind)| CoreUsage { kind, usage })
-        .collect()
 }
 
 fn read_ticks() -> Vec<[u32; 4]> {
@@ -173,7 +158,7 @@ mod tests {
         let before = refs();
         for _ in 0..50 {
             ticks.sample();
-            crate::memory::read(1 << 34);
+            crate::macos::memory::read(1 << 34);
         }
         // Tests running in parallel can hold a reference for a moment; a leak
         // would add one per call, a hundred here.

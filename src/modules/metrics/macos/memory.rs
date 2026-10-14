@@ -1,5 +1,5 @@
+use super::sys;
 use crate::snapshot::{Memory, Swap};
-use crate::sys;
 
 /// `None` when the kernel's page counts can't be read, so a failed read is
 /// not mistaken for idle memory.

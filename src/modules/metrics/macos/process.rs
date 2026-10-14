@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int};
 use std::time::Instant;
 
-use crate::cf;
+use super::cf;
+use super::sys::{self, read_i32, read_i64};
+use crate::signal::{Signal, SignalError};
 use crate::snapshot::Process;
-use crate::sys::{self, read_i32, read_i64};
 
 /// A pid is reused after exit; the start time tells the two processes apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -175,22 +176,6 @@ impl Default for ProcessTable {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Why a signal could not be delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignalError {
-    /// The process belongs to another user or to the system.
-    NotPermitted,
-    /// The process already exited.
-    NoSuchProcess,
-    Other(i32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Signal {
-    Terminate,
-    Kill,
 }
 
 /// Signals the process `pid` only while it is still the one that started at

@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use crate::cf;
+use super::cf;
+use super::sys;
 use crate::snapshot::Volume;
-use crate::sys;
 
 /// The startup volume and the volumes Finder shows under `/Volumes`. `None`
 /// when the mount table can't be read.

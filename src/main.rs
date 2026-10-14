@@ -28,7 +28,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let report = json!({
         "interval_secs": INTERVAL.as_secs_f64(),
         "chip": sampler.chip(),
-        "has_ioreport": sampler.has_ioreport(),
         "cpu_usage": snapshot.cpu.usage(),
         "power_total": snapshot.power.total(),
         "snapshot": snapshot,

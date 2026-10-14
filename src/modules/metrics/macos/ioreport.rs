@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::time::Instant;
 
-use crate::cf::{
+use super::cf::{
     self, CFDictionaryRef, CFMutableDictionaryRef, CFOwned, CFStringRef, CFType, CFTypeRef,
     io_object_t,
 };

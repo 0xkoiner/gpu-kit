@@ -5,8 +5,10 @@
 pub struct ChipInfo {
     /// Marketing name, for example `Apple M1 Max`.
     pub name: String,
-    /// In logical CPU order, which Apple Silicon numbers slowest tier first;
-    /// empty when macOS reports no performance levels.
+    /// In logical CPU order. Apple Silicon numbers its slowest tier first;
+    /// Linux groups cores by the speed the kernel gives them, and a chip whose
+    /// cores are all alike has one tier. Empty when the OS reports no levels at
+    /// all, as on an Intel Mac.
     pub tiers: Vec<CoreTier>,
     pub gpu_cores: u32,
     pub memory_bytes: u64,
@@ -47,7 +49,7 @@ pub struct CoreUsage {
 pub struct Cpu {
     pub cores: Vec<CoreUsage>,
     /// One per core tier, in [`ChipInfo::tiers`] order, since two tiers can
-    /// share a kind; empty without IOReport.
+    /// share a kind; empty without IOReport (macOS) or cpufreq (Linux).
     pub clocks: Vec<TierClock>,
 }
 
@@ -82,9 +84,11 @@ pub struct Gpu {
     pub mhz: Option<u32>,
 }
 
-/// Power draw in watts, averaged over the sample interval. A block is `None`
-/// without IOReport, and CPU, ANE and DRAM also while their energy counters
-/// are dead, as macOS 27 betas leave them.
+/// Power draw in watts, averaged over the sample interval. On macOS a block
+/// is `None` without IOReport, and CPU, ANE and DRAM also while their energy
+/// counters are dead, as macOS 27 betas leave them. On Linux CPU and DRAM come
+/// from RAPL, which VMs rarely expose and recent kernels open to root alone,
+/// GPU from its driver, and ANE is always `None`.
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
@@ -93,7 +97,9 @@ pub struct Power {
     pub gpu: Option<f32>,
     pub ane: Option<f32>,
     pub dram: Option<f32>,
-    /// Whole-system draw as the SMC reports it; `None` where it doesn't.
+    /// Whole-system draw, where the machine meters it: the SMC on a Mac;
+    /// RAPL's `psys` domain or, on battery, the battery's discharge on Linux.
+    /// `None` elsewhere.
     pub system: Option<f32>,
 }
 
@@ -116,6 +122,9 @@ pub struct Temperatures {
     pub gpu: Option<f32>,
 }
 
+/// How hard the kernel is holding temperatures down. macOS reports it as
+/// such; Linux has no such level, so it's read off the thermal zones' trip
+/// points there, and Sleeping is never reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
@@ -214,7 +223,8 @@ pub struct Process {
     pub command: String,
     /// Share of one core, so a busy multi-threaded process can exceed 100.
     pub cpu: f32,
-    /// Share of the GPU's busy time, 0–100.
+    /// Share of the GPU's busy time, 0–100. On Linux only NVML reports it; 0
+    /// otherwise.
     pub gpu: f32,
     /// Resident memory as a share of physical memory, 0–100.
     pub memory: f32,
@@ -229,10 +239,11 @@ pub struct Process {
 #[non_exhaustive]
 pub struct Snapshot {
     pub cpu: Cpu,
-    /// `None` without IOReport.
+    /// `None` without IOReport (macOS) or a GPU driver's telemetry (Linux).
     pub gpu: Option<Gpu>,
     /// Neural Engine load, 0–100, estimated from its power draw: Apple
-    /// exposes no occupancy counter. `None` without a power reading.
+    /// exposes no occupancy counter. `None` without a power reading, so always
+    /// on Linux.
     pub ane: Option<f32>,
     /// Bytes per second the Neural Engine moved through memory; `None` where
     /// the chip has no such counter.
@@ -240,7 +251,7 @@ pub struct Snapshot {
     pub power: Power,
     pub temperatures: Temperatures,
     /// `None` when the notify state can't be read or is a level macOS
-    /// doesn't define.
+    /// doesn't define; on Linux, without thermal zones, as in a VM.
     pub thermal: Option<ThermalPressure>,
     /// `None` when the kernel's page counts can't be read.
     pub memory: Option<Memory>,

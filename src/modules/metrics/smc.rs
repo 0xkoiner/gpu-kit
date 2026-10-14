@@ -1,4 +1,5 @@
-//! System Management Controller keys over the `AppleSMC` user client.
+//! System Management Controller keys over the `AppleSMC` user client. The
+//! command numbers and the `SMCKeyData_t` layout follow smcFanControl's `smc.h`.
 
 use crate::modules::metrics::cf;
 use crate::modules::metrics::sys;
@@ -7,7 +8,9 @@ const KERNEL_INDEX_SMC: u32 = 2;
 const CMD_READ_BYTES: u8 = 5;
 const CMD_READ_INDEX: u8 = 8;
 const CMD_READ_KEYINFO: u8 = 9;
-const RESULT_KEY_NOT_FOUND: u8 = 132;
+/// `kSMCSuccess`. The SMC reports its own failures here (a missing key, a
+/// collision with another client, a bad argument) while the call itself succeeds.
+const RESULT_SUCCESS: u8 = 0;
 const TYPE_FLT: u32 = u32::from_be_bytes(*b"flt ");
 
 #[repr(C)]
@@ -63,10 +66,15 @@ pub struct Smc {
 }
 
 impl Smc {
-    /// Opens the SMC and indexes its temperature keys once; `None` when the
-    /// user client cannot be opened.
+    /// Opens the SMC and indexes its CPU and GPU temperature keys and its
+    /// `PSTR` power key. `None` when the user client can't be opened or the
+    /// SMC's key count can't be read.
+    ///
+    /// Indexing costs a kernel call for every key the SMC has, so open it once,
+    /// off the UI thread.
     pub fn open() -> Option<Self> {
         let connection = unsafe {
+            // `IOServiceGetMatchingService` consumes the matching dictionary.
             let service = cf::IOServiceGetMatchingService(
                 cf::kIOMainPortDefault,
                 cf::IOServiceMatching(c"AppleSMC".as_ptr()),
@@ -76,6 +84,7 @@ impl Smc {
             }
             let mut connection = 0;
             let rc = cf::IOServiceOpen(service, sys::mach_task_self_, 0, &mut connection);
+            // An open connection holds its own reference to the service.
             cf::IOObjectRelease(service);
             if rc != 0 {
                 return None;
@@ -88,21 +97,30 @@ impl Smc {
             gpu_keys: Vec::new(),
             system_power: None,
         };
-        smc.index_keys();
+        let count = smc.key_count()?;
+        smc.index_keys(count);
         Some(smc)
     }
 
     /// Mean of the CPU (`Tp*`, `Te*`) and GPU (`Tg*`) die sensors, in °C.
+    /// Each is `None` when the chip has no such sensor or none of them gives a
+    /// plausible reading.
     pub fn temperatures(&self) -> (Option<f32>, Option<f32>) {
         (self.mean(&self.cpu_keys), self.mean(&self.gpu_keys))
     }
 
-    /// Whole-system power from key `PSTR`, in watts.
+    /// Whole-system power from key `PSTR`, in watts. `None` where the SMC has
+    /// no such key, or when the read fails or isn't a finite, positive number:
+    /// a running Mac never draws 0 W, so a 0 means the SMC isn't reporting it.
     pub fn system_power(&self) -> Option<f32> {
         let (key, info) = self.system_power?;
         self.read_float(key, info)
+            .filter(|watts| watts.is_finite() && *watts > 0.0)
     }
 
+    /// Mean of the readings that can be real: a running die is above 0 °C and
+    /// would have shut down long before 150 °C, so anything outside that is a
+    /// sensor with nothing behind it or a failed read.
     fn mean(&self, keys: &[(u32, KeyInfo)]) -> Option<f32> {
         let readings: Vec<f32> = keys
             .iter()
@@ -112,12 +130,15 @@ impl Smc {
         (!readings.is_empty()).then(|| readings.iter().sum::<f32>() / readings.len() as f32)
     }
 
-    fn index_keys(&mut self) {
-        let count = self
-            .key_info(fourcc(b"#KEY"))
-            .and_then(|info| self.read_bytes(fourcc(b"#KEY"), info))
+    /// How many keys the SMC has, from its `#KEY` key.
+    fn key_count(&self) -> Option<u32> {
+        let key = fourcc(b"#KEY");
+        let info = self.key_info(key)?;
+        self.read_bytes(key, info)
             .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-            .unwrap_or(0);
+    }
+
+    fn index_keys(&mut self, count: u32) {
         for ix in 0..count {
             let Some(key) = self.key_at(ix) else { continue };
             let name = key.to_be_bytes();
@@ -146,6 +167,9 @@ impl Smc {
     fn call(&self, input: &KeyData) -> Option<KeyData> {
         let mut output = KeyData::default();
         let mut size = size_of::<KeyData>();
+        // Both buffers are `SMCKeyData_t`s, and `size` caps what the kernel may
+        // write to `output`. Every field is a plain integer, so any bytes it
+        // writes are valid.
         let rc = unsafe {
             cf::IOConnectCallStructMethod(
                 self.connection,
@@ -156,7 +180,7 @@ impl Smc {
                 &mut size,
             )
         };
-        (rc == 0 && output.result != RESULT_KEY_NOT_FOUND).then_some(output)
+        (rc == 0 && output.result == RESULT_SUCCESS).then_some(output)
     }
 
     fn key_at(&self, ix: u32) -> Option<u32> {

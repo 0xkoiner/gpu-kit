@@ -116,9 +116,7 @@ pub const CTL_NET: c_int = 4;
 pub const KERN_PROC: c_int = 14;
 pub const KERN_PROC_ALL: c_int = 0;
 pub const KERN_PROC_PID: c_int = 1;
-pub const PF_ROUTE: c_int = 17;
-pub const NET_RT_IFLIST2: c_int = 6;
-pub const RTM_IFINFO2: u8 = 0x12;
+pub const PF_LINK: c_int = 18;
 pub const ENOMEM: c_int = 12;
 
 unsafe extern "C" {
@@ -329,6 +327,7 @@ pub const SIGKILL: c_int = 9;
 pub const EPERM: c_int = 1;
 pub const ESRCH: c_int = 3;
 pub const EINVAL: c_int = 22;
+pub const ERANGE: c_int = 34;
 
 unsafe extern "C" {
     pub fn getpwuid_r(
@@ -362,7 +361,33 @@ pub fn send_signal(pid: c_int, sig: c_int) -> Result<(), c_int> {
     }
 }
 
-pub const IFF_LOOPBACK: i32 = 0x8;
+// <net/if.h>, <net/if_types.h>, <net/if_mib.h>
+pub const IFF_LOOPBACK: u32 = 0x8;
+pub const IFF_POINTOPOINT: u32 = 0x10;
+pub const IFT_LOOP: u8 = 0x18;
+pub const IFT_L2VLAN: u8 = 0x87;
+pub const IFT_IEEE8023ADLAG: u8 = 0x88;
+pub const IFT_BRIDGE: u8 = 0xd1;
+pub const NETLINK_GENERIC: c_int = 0;
+pub const IFMIB_IFALLDATA: c_int = 3;
+pub const IFDATA_GENERAL: c_int = 1;
+
+/// Byte offsets into `struct ifmibdata` (180 bytes). Its `struct if_data64`
+/// is packed to 4 bytes, so x86_64 (Rosetta) has the same layout.
+pub mod ifmibdata {
+    pub const SIZE: usize = 180;
+    /// `ifmd_name`, NUL-terminated within `IFNAMSIZ`; empty while the
+    /// interface is still attaching or already detaching.
+    pub const NAME: usize = 0;
+    pub const NAME_LEN: usize = 16;
+    /// `ifmd_flags`, the `IFF_*` flags.
+    pub const FLAGS: usize = 20;
+    /// `ifmd_data.ifi_type`, an `IFT_*` value.
+    pub const TYPE: usize = 52;
+    pub const MTU: usize = 52 + 8;
+    pub const IBYTES: usize = 52 + 64;
+    pub const OBYTES: usize = 52 + 72;
+}
 
 // <sys/mount.h>, in its 64-bit inode layout: the only one on arm64, and the
 // `$INODE64` symbols on x86_64 (Rosetta).
@@ -397,8 +422,41 @@ unsafe extern "C" {
     /// Thread-safe `getmntinfo`: the buffer belongs to the caller, who frees it.
     /// On x86_64 the plain symbol returns the old, smaller `statfs`.
     #[cfg_attr(target_arch = "x86_64", link_name = "getmntinfo_r_np$INODE64")]
-    pub fn getmntinfo_r_np(mntbufp: *mut *mut statfs, flags: c_int) -> c_int;
-    pub fn free(ptr: *mut c_void);
+    fn getmntinfo_r_np(mntbufp: *mut *mut statfs, flags: c_int) -> c_int;
+    fn free(ptr: *mut c_void);
+}
+
+/// The kernel's mount table, freed on drop.
+pub struct MountTable {
+    entries: ptr::NonNull<statfs>,
+    count: usize,
+}
+
+impl MountTable {
+    /// `None` when the table can't be read. `MNT_NOWAIT` takes each
+    /// filesystem's cached sizes, so an unresponsive network mount can't stall
+    /// the read.
+    pub fn read() -> Option<Self> {
+        let mut entries: *mut statfs = ptr::null_mut();
+        let count = unsafe { getmntinfo_r_np(&mut entries, MNT_NOWAIT) };
+        let count = usize::try_from(count).ok().filter(|&count| count > 0)?;
+        Some(Self {
+            entries: ptr::NonNull::new(entries)?,
+            count,
+        })
+    }
+
+    pub fn entries(&self) -> &[statfs] {
+        // `getmntinfo_r_np` filled `count` entries, which live until drop.
+        unsafe { std::slice::from_raw_parts(self.entries.as_ptr(), self.count) }
+    }
+}
+
+impl Drop for MountTable {
+    fn drop(&mut self) {
+        // `getmntinfo_r_np` mallocs the buffer and hands it to us.
+        unsafe { free(self.entries.as_ptr().cast()) };
+    }
 }
 
 /// Converts a fixed, NUL-padded C array to a `String`.
@@ -411,13 +469,27 @@ pub fn c_array_to_string(chars: &[c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Reads the native-endian integer at byte `at` of a record the kernel filled.
+/// Panics past the end, so callers bound `at` by the record's size first.
+pub fn read_i32(bytes: &[u8], at: usize) -> i32 {
+    i32::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+pub fn read_u32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+pub fn read_i64(bytes: &[u8], at: usize) -> i64 {
+    i64::from_ne_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+}
+
+pub fn read_u64(bytes: &[u8], at: usize) -> u64 {
+    u64::from_ne_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn read_i32(buf: &[u8], offset: usize) -> i32 {
-        i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap())
-    }
 
     #[test]
     fn string_sysctl_reads_up_to_the_nul() {
@@ -440,15 +512,35 @@ mod tests {
     }
 
     #[test]
+    fn interface_table_reads_loopback_at_the_ifmibdata_offsets() {
+        let mut mib = [
+            CTL_NET,
+            PF_LINK,
+            NETLINK_GENERIC,
+            IFMIB_IFALLDATA,
+            0,
+            IFDATA_GENERAL,
+        ];
+        let table = sysctl_table(&mut mib).expect("net.link.generic.ifalldata unreadable");
+        assert_eq!(table.len() % ifmibdata::SIZE, 0);
+        let lo0 = table
+            .chunks_exact(ifmibdata::SIZE)
+            .find(|record| record[ifmibdata::NAME..].starts_with(b"lo0\0"))
+            .expect("no lo0 record");
+        assert_ne!(read_u32(lo0, ifmibdata::FLAGS) & IFF_LOOPBACK, 0);
+        assert_eq!(lo0[ifmibdata::TYPE], IFT_LOOP);
+        // xnu's `LOMTU`: a wrong `if_data64` offset lands this read elsewhere.
+        assert_eq!(read_u32(lo0, ifmibdata::MTU), 16384);
+    }
+
+    #[test]
     fn mount_table_entries_read_back_as_mount_paths() {
-        let mut mounts: *mut statfs = ptr::null_mut();
-        let count = unsafe { getmntinfo_r_np(&mut mounts, MNT_NOWAIT) };
-        assert!(count > 0 && !mounts.is_null(), "getmntinfo_r_np failed");
-        let paths: Vec<String> = unsafe { std::slice::from_raw_parts(mounts, count as usize) }
+        let table = MountTable::read().expect("getmntinfo_r_np failed");
+        let paths: Vec<String> = table
+            .entries()
             .iter()
             .map(|mount| c_array_to_string(&mount.f_mntonname))
             .collect();
-        unsafe { free(mounts.cast()) };
         // A wrong `statfs` layout lands these reads mid-entry, off the paths.
         assert!(paths.iter().any(|path| path == "/"), "{paths:?}");
         assert!(paths.iter().all(|path| path.starts_with('/')), "{paths:?}");

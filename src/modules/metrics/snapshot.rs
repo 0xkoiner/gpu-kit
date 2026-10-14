@@ -232,7 +232,8 @@ pub struct Snapshot {
     /// `None` on the first sample, which only sets the baseline, and when no
     /// physical disk's counters can be read.
     pub disk: Option<Throughput>,
-    pub volumes: Vec<Volume>,
+    /// `None` when the mount table can't be read.
+    pub volumes: Option<Vec<Volume>>,
     pub battery: Option<Battery>,
     pub uptime_secs: u64,
     pub processes: Vec<Process>,

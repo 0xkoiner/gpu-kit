@@ -1,6 +1,7 @@
 //! Raw declarations for the macOS system libraries this crate reads.
 //!
-//! Layouts follow the arm64 macOS SDK headers named next to each item.
+//! Layouts follow the arm64 macOS SDK headers named next to each item; where
+//! x86_64 (Rosetta) differs, the item says so.
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
@@ -20,7 +21,9 @@ pub const CPU_STATE_IDLE: usize = 2;
 pub const CPU_STATE_NICE: usize = 3;
 pub const HOST_VM_INFO64: c_int = 4;
 
-/// `struct vm_statistics64` from <mach/vm_statistics.h>.
+/// `struct vm_statistics64` from <mach/vm_statistics.h>, up to its rev1 fields.
+/// Newer SDKs append more, so pass [`Self::COUNT`] to `host_statistics64`,
+/// never the SDK's `HOST_VM_INFO64_COUNT`, or the kernel writes past the end.
 #[repr(C)]
 #[derive(Default)]
 pub struct vm_statistics64 {
@@ -49,6 +52,14 @@ pub struct vm_statistics64 {
     pub internal_page_count: natural_t,
     pub total_uncompressed_pages_in_compressor: u64,
 }
+
+impl vm_statistics64 {
+    /// The size in `integer_t`s that `host_statistics64` takes as its count.
+    pub const COUNT: natural_t = (size_of::<Self>() / size_of::<integer_t>()) as natural_t;
+}
+
+pub const HOST_VM_INFO64_REV1_COUNT: natural_t = 38;
+const _: () = assert!(vm_statistics64::COUNT == HOST_VM_INFO64_REV1_COUNT);
 
 /// `struct mach_timebase_info` from <mach/mach_time.h>.
 #[repr(C)]
@@ -128,8 +139,34 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Reads a fixed-size `sysctl` value.
-pub fn sysctl_value<T: Default>(name: &str) -> Option<T> {
+/// A type the kernel may fill with raw bytes.
+///
+/// # Safety
+/// Every bit pattern must be a valid `Self`: integers, or `#[repr(C)]` structs
+/// of them. The kernel can copy a partial value before failing, and that
+/// value is still dropped.
+pub unsafe trait Plain: Default {}
+
+unsafe impl Plain for i32 {}
+unsafe impl Plain for u32 {}
+unsafe impl Plain for i64 {}
+unsafe impl Plain for u64 {}
+
+/// Reads a fixed-size `sysctl` value:
+///
+/// ```
+/// use gpu_ui::modules::metrics::sys::sysctl_value;
+/// assert!(sysctl_value::<u32>("hw.ncpu").is_some_and(|cpus| cpus > 0));
+/// ```
+///
+/// The kernel writes raw bytes into `T`, so a type with pointers or
+/// invariants is refused:
+///
+/// ```compile_fail,E0277
+/// use gpu_ui::modules::metrics::sys::sysctl_value;
+/// let _ = sysctl_value::<String>("kern.ostype");
+/// ```
+pub fn sysctl_value<T: Plain>(name: &str) -> Option<T> {
     let name = CString::new(name).ok()?;
     let mut value = T::default();
     let mut len = size_of::<T>();
@@ -145,36 +182,17 @@ pub fn sysctl_value<T: Default>(name: &str) -> Option<T> {
     (rc == 0 && len == size_of::<T>()).then_some(value)
 }
 
-/// Reads a variable-size `sysctl` table, growing the buffer while it races new entries.
-pub fn sysctl_table(mib: &mut [c_int]) -> Option<Vec<u8>> {
+/// Reads a variable-size `sysctl` value through `read(oldp, oldlenp)`, growing
+/// the buffer while the value races to outgrow it between the probe and the read.
+fn read_growing(mut read: impl FnMut(*mut c_void, &mut usize) -> c_int) -> Option<Vec<u8>> {
     for _ in 0..4 {
         let mut len = 0usize;
-        let rc = unsafe {
-            sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as c_uint,
-                ptr::null_mut(),
-                &mut len,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 {
+        if read(ptr::null_mut(), &mut len) != 0 {
             return None;
         }
         len += len / 8;
         let mut buf = vec![0u8; len];
-        let rc = unsafe {
-            sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as c_uint,
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if rc == 0 {
+        if read(buf.as_mut_ptr().cast(), &mut len) == 0 {
             buf.truncate(len);
             return Some(buf);
         }
@@ -185,32 +203,28 @@ pub fn sysctl_table(mib: &mut [c_int]) -> Option<Vec<u8>> {
     None
 }
 
+/// Reads a variable-size `sysctl` table.
+pub fn sysctl_table(mib: &mut [c_int]) -> Option<Vec<u8>> {
+    let namelen = mib.len() as c_uint;
+    // `read_growing` passes a null `oldp` or one backed by `*oldlenp` bytes.
+    read_growing(|oldp, len| unsafe {
+        sysctl(mib.as_mut_ptr(), namelen, oldp, len, ptr::null_mut(), 0)
+    })
+}
+
 /// Reads a string `sysctl` value.
 pub fn sysctl_string(name: &str) -> Option<String> {
     let name = CString::new(name).ok()?;
-    let mut len = 0usize;
-    unsafe {
-        if sysctlbyname(name.as_ptr(), ptr::null_mut(), &mut len, ptr::null_mut(), 0) != 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; len];
-        if sysctlbyname(
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            ptr::null_mut(),
-            0,
-        ) != 0
-        {
-            return None;
-        }
-        Some(
-            CStr::from_bytes_until_nul(&buf)
-                .ok()?
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
+    // `read_growing` passes a null `oldp` or one backed by `*oldlenp` bytes.
+    let buf = read_growing(|oldp, len| unsafe {
+        sysctlbyname(name.as_ptr(), oldp, len, ptr::null_mut(), 0)
+    })?;
+    Some(
+        CStr::from_bytes_until_nul(&buf)
+            .ok()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// `struct xsw_usage` from <sys/sysctl.h>, the value of `vm.swapusage`.
@@ -224,6 +238,8 @@ pub struct xsw_usage {
     pub xsu_encrypted: u32,
 }
 
+unsafe impl Plain for xsw_usage {}
+
 /// `struct timeval` from <sys/_types/_timeval.h>, the value of `kern.boottime`.
 #[repr(C)]
 #[derive(Default)]
@@ -231,6 +247,8 @@ pub struct timeval {
     pub tv_sec: i64,
     pub tv_usec: i32,
 }
+
+unsafe impl Plain for timeval {}
 
 /// Byte offsets into `struct kinfo_proc` (648 bytes on arm64).
 pub mod kinfo_proc {
@@ -310,6 +328,7 @@ pub const SIGTERM: c_int = 15;
 pub const SIGKILL: c_int = 9;
 pub const EPERM: c_int = 1;
 pub const ESRCH: c_int = 3;
+pub const EINVAL: c_int = 22;
 
 unsafe extern "C" {
     pub fn getpwuid_r(
@@ -319,7 +338,8 @@ unsafe extern "C" {
         buflen: usize,
         result: *mut *mut passwd,
     ) -> c_int;
-    pub fn kill(pid: c_int, sig: c_int) -> c_int;
+    /// Private: callers go through [`send_signal`].
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     pub fn geteuid() -> u32;
     pub fn __error() -> *mut c_int;
 }
@@ -328,9 +348,24 @@ pub fn errno() -> c_int {
     unsafe { *__error() }
 }
 
+/// Sends `sig` to the single process `pid`, or returns the errno. A pid of 0
+/// would signal our own process group and -1 every process we may signal, so
+/// both are refused with `EINVAL`. Guarding against pid reuse is the caller's job.
+pub fn send_signal(pid: c_int, sig: c_int) -> Result<(), c_int> {
+    if pid <= 0 {
+        return Err(EINVAL);
+    }
+    if unsafe { kill(pid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
 pub const IFF_LOOPBACK: i32 = 0x8;
 
-// <sys/mount.h>; arm64 only has the 64-bit inode layout.
+// <sys/mount.h>, in its 64-bit inode layout: the only one on arm64, and the
+// `$INODE64` symbols on x86_64 (Rosetta).
 pub const MFSNAMELEN: usize = 16;
 pub const MAXPATHLEN: usize = 1024;
 pub const MNT_NOWAIT: c_int = 2;
@@ -360,6 +395,8 @@ pub struct statfs {
 
 unsafe extern "C" {
     /// Thread-safe `getmntinfo`: the buffer belongs to the caller, who frees it.
+    /// On x86_64 the plain symbol returns the old, smaller `statfs`.
+    #[cfg_attr(target_arch = "x86_64", link_name = "getmntinfo_r_np$INODE64")]
     pub fn getmntinfo_r_np(mntbufp: *mut *mut statfs, flags: c_int) -> c_int;
     pub fn free(ptr: *mut c_void);
 }
@@ -372,4 +409,60 @@ pub fn c_array_to_string(chars: &[c_char]) -> String {
         .map(|&c| c as u8)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_i32(buf: &[u8], offset: usize) -> i32 {
+        i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn string_sysctl_reads_up_to_the_nul() {
+        assert_eq!(sysctl_string("kern.ostype").as_deref(), Some("Darwin"));
+    }
+
+    #[test]
+    fn missing_string_sysctl_is_none() {
+        assert_eq!(sysctl_string("kern.no_such_name"), None);
+    }
+
+    #[test]
+    fn table_sysctl_reads_this_process_at_the_kinfo_proc_offsets() {
+        let pid = std::process::id() as c_int;
+        let buf = sysctl_table(&mut [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid])
+            .expect("kern.proc.pid unreadable");
+        assert_eq!(buf.len(), kinfo_proc::SIZE);
+        assert_eq!(read_i32(&buf, kinfo_proc::PID), pid);
+        assert_eq!(read_i32(&buf, kinfo_proc::UID) as u32, unsafe { geteuid() });
+    }
+
+    #[test]
+    fn mount_table_entries_read_back_as_mount_paths() {
+        let mut mounts: *mut statfs = ptr::null_mut();
+        let count = unsafe { getmntinfo_r_np(&mut mounts, MNT_NOWAIT) };
+        assert!(count > 0 && !mounts.is_null(), "getmntinfo_r_np failed");
+        let paths: Vec<String> = unsafe { std::slice::from_raw_parts(mounts, count as usize) }
+            .iter()
+            .map(|mount| c_array_to_string(&mount.f_mntonname))
+            .collect();
+        unsafe { free(mounts.cast()) };
+        // A wrong `statfs` layout lands these reads mid-entry, off the paths.
+        assert!(paths.iter().any(|path| path == "/"), "{paths:?}");
+        assert!(paths.iter().all(|path| path.starts_with('/')), "{paths:?}");
+    }
+
+    #[test]
+    fn signalling_our_group_or_every_process_is_refused() {
+        // Signal 0 only checks the target, so even a broken guard sends nothing.
+        assert_eq!(send_signal(0, 0), Err(EINVAL));
+        assert_eq!(send_signal(-1, 0), Err(EINVAL));
+    }
+
+    #[test]
+    fn signal_reaches_a_single_process() {
+        assert_eq!(send_signal(std::process::id() as c_int, 0), Ok(()));
+    }
 }

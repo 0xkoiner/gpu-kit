@@ -29,8 +29,7 @@ fn memory_from(
 /// The kernel's page counts, in units of [`kernel_page_size`].
 fn vm_statistics() -> Option<sys::vm_statistics64> {
     let mut stats = sys::vm_statistics64::default();
-    let mut count =
-        (size_of::<sys::vm_statistics64>() / size_of::<sys::integer_t>()) as sys::natural_t;
+    let mut count = sys::vm_statistics64::COUNT;
     let rc = unsafe {
         sys::host_statistics64(
             sys::host_port(),

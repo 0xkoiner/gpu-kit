@@ -1,14 +1,16 @@
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::time::Instant;
 
 use crate::modules::metrics::rate::{ByteCounts, ByteRates};
 use crate::modules::metrics::snapshot::Throughput;
-use crate::modules::metrics::sys;
+use crate::modules::metrics::sys::{self, ifmibdata};
 
-/// 64-bit byte counters of each non-loopback interface; rates come from deltas.
+/// 64-bit byte counters of each interface that carries its own traffic;
+/// rates come from deltas.
 #[derive(Default)]
 pub struct NetworkCounters {
-    rates: ByteRates<u16>,
+    rates: ByteRates<String>,
 }
 
 impl NetworkCounters {
@@ -19,38 +21,115 @@ impl NetworkCounters {
     }
 }
 
-// `struct if_msghdr2` from <net/if.h>: msglen u16 @0, type u8 @3, flags i32 @8,
-// index u16 @12, then `struct if_data64` @32 with ibytes u64 @+64 and obytes u64 @+72.
-const MSG_LEN: usize = 0;
-const MSG_TYPE: usize = 3;
-const MSG_FLAGS: usize = 8;
-const MSG_INDEX: usize = 12;
-const IBYTES: usize = 32 + 64;
-const OBYTES: usize = 32 + 72;
+/// Counters of each interface by name, so interfaces coming and going
+/// (USB adapters, Thunderbolt docks) don't net against the others' traffic.
+///
+/// Read from `net.link.generic.ifalldata`, not `NET_RT_IFLIST2`: for a
+/// non-Apple binary that one rounds the byte counters to 1 KiB and truncates
+/// them to 32 bits, so they wrap every 4 GiB.
+fn read_interfaces() -> Option<HashMap<String, ByteCounts>> {
+    let mut mib = [
+        sys::CTL_NET,
+        sys::PF_LINK,
+        sys::NETLINK_GENERIC,
+        sys::IFMIB_IFALLDATA,
+        0,
+        sys::IFDATA_GENERAL,
+    ];
+    parse_interfaces(&sys::sysctl_table(&mut mib)?)
+}
 
-/// Counters of each interface by index, so interfaces coming and going
-/// (VPN tunnels, USB adapters) don't net against the others' traffic.
-fn read_interfaces() -> Option<HashMap<u16, ByteCounts>> {
-    let mut mib = [sys::CTL_NET, sys::PF_ROUTE, 0, 0, sys::NET_RT_IFLIST2, 0];
-    let table = sys::sysctl_table(&mut mib)?;
-    let mut interfaces = HashMap::new();
-    let mut at = 0;
-    while at + OBYTES + 8 <= table.len() {
-        let msg = &table[at..];
-        let len = u16::from_ne_bytes([msg[MSG_LEN], msg[MSG_LEN + 1]]) as usize;
-        if len == 0 {
-            break;
-        }
-        let flags = i32::from_ne_bytes(msg[MSG_FLAGS..MSG_FLAGS + 4].try_into().ok()?);
-        if msg[MSG_TYPE] == sys::RTM_IFINFO2 && flags & sys::IFF_LOOPBACK == 0 {
-            let index = u16::from_ne_bytes([msg[MSG_INDEX], msg[MSG_INDEX + 1]]);
-            let counts = ByteCounts {
-                read: u64::from_ne_bytes(msg[IBYTES..IBYTES + 8].try_into().ok()?),
-                written: u64::from_ne_bytes(msg[OBYTES..OBYTES + 8].try_into().ok()?),
-            };
-            interfaces.insert(index, counts);
-        }
-        at += len;
+/// Parses a table of `struct ifmibdata`. `None` if it isn't whole records,
+/// as then its layout isn't the one the offsets describe.
+fn parse_interfaces(table: &[u8]) -> Option<HashMap<String, ByteCounts>> {
+    if !table.len().is_multiple_of(ifmibdata::SIZE) {
+        return None;
     }
+    let interfaces = table
+        .chunks_exact(ifmibdata::SIZE)
+        .filter_map(|record| {
+            let name = &record[ifmibdata::NAME..ifmibdata::NAME + ifmibdata::NAME_LEN];
+            let name = CStr::from_bytes_until_nul(name).ok()?.to_str().ok()?;
+            let counts = ByteCounts {
+                read: sys::read_u64(record, ifmibdata::IBYTES),
+                written: sys::read_u64(record, ifmibdata::OBYTES),
+            };
+            carries_own_traffic(name, record).then(|| (name.to_owned(), counts))
+        })
+        .collect();
     Some(interfaces)
+}
+
+/// Whether an interface's traffic is counted on it alone. Loopback never
+/// leaves the Mac. Tunnels (utun, ipsec, ppp) carry traffic the link under
+/// them counts again, encapsulated; bridges, VLANs and link aggregates count
+/// what their member links already do; and a VM's `vmenet` end either stays
+/// on the Mac or is forwarded through a physical link. An empty name is an
+/// interface still attaching or already detaching.
+fn carries_own_traffic(name: &str, record: &[u8]) -> bool {
+    let flags = sys::read_u32(record, ifmibdata::FLAGS);
+    let layered = matches!(
+        record[ifmibdata::TYPE],
+        sys::IFT_BRIDGE | sys::IFT_L2VLAN | sys::IFT_IEEE8023ADLAG
+    );
+    !name.is_empty()
+        && flags & (sys::IFF_LOOPBACK | sys::IFF_POINTOPOINT) == 0
+        && !layered
+        && !name.starts_with("vmenet")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `IFF_UP`, `IFT_ETHER` and `IFT_OTHER`.
+    const UP: u32 = 0x1;
+    const ETHER: u8 = 0x6;
+    const OTHER: u8 = 0x1;
+
+    fn record(name: &str, flags: u32, kind: u8, read: u64, written: u64) -> Vec<u8> {
+        let mut record = vec![0; ifmibdata::SIZE];
+        record[ifmibdata::NAME..][..name.len()].copy_from_slice(name.as_bytes());
+        record[ifmibdata::FLAGS..][..4].copy_from_slice(&flags.to_ne_bytes());
+        record[ifmibdata::TYPE] = kind;
+        record[ifmibdata::IBYTES..][..8].copy_from_slice(&read.to_ne_bytes());
+        record[ifmibdata::OBYTES..][..8].copy_from_slice(&written.to_ne_bytes());
+        record
+    }
+
+    #[test]
+    fn counters_past_4_gib_read_whole() {
+        // `NET_RT_IFLIST2` would hand these to us truncated to 32 bits.
+        let table = record("en0", UP, ETHER, 5_000_000_000, 6_000_000_000);
+        let en0 = parse_interfaces(&table).expect("whole records")["en0"];
+        assert_eq!((en0.read, en0.written), (5_000_000_000, 6_000_000_000));
+    }
+
+    #[test]
+    fn traffic_counted_on_another_interface_is_skipped() {
+        let table = [
+            record("en0", UP, ETHER, 1, 1),
+            record("awdl0", UP, ETHER, 1, 1),
+            record("lo0", UP | sys::IFF_LOOPBACK, sys::IFT_LOOP, 1, 1),
+            record("utun3", UP | sys::IFF_POINTOPOINT, OTHER, 1, 1),
+            record("bridge0", UP, sys::IFT_BRIDGE, 1, 1),
+            record("vlan0", UP, sys::IFT_L2VLAN, 1, 1),
+            record("bond0", UP, sys::IFT_IEEE8023ADLAG, 1, 1),
+            record("vmenet0", UP, ETHER, 1, 1),
+            // An interface mid-attach or detach comes back zeroed.
+            vec![0; ifmibdata::SIZE],
+        ]
+        .concat();
+        let interfaces = parse_interfaces(&table).expect("whole records");
+        let mut names: Vec<_> = interfaces.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["awdl0", "en0"]);
+    }
+
+    #[test]
+    fn a_table_of_partial_records_is_refused() {
+        let mut table = record("en0", UP, ETHER, 1, 1);
+        table.pop();
+        assert!(parse_interfaces(&table).is_none());
+    }
 }

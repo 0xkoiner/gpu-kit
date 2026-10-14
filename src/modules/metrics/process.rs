@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::modules::metrics::cf;
 use crate::modules::metrics::snapshot::Process;
-use crate::modules::metrics::sys;
+use crate::modules::metrics::sys::{self, read_i32, read_i64};
 
 /// A pid is reused after exit; the start time tells the two processes apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,14 +284,6 @@ fn parse_creator_pid(creator: &str) -> Option<i32> {
         .trim()
         .parse()
         .ok()
-}
-
-fn read_i32(bytes: &[u8], at: usize) -> i32 {
-    i32::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
-}
-
-fn read_i64(bytes: &[u8], at: usize) -> i64 {
-    i64::from_ne_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
 
 #[cfg(test)]

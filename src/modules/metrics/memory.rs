@@ -1,17 +1,17 @@
-use crate::modules::metrics::snapshot::Memory;
+use crate::modules::metrics::snapshot::{Memory, Swap};
 use crate::modules::metrics::sys;
 
 /// `None` when the kernel's page counts can't be read, so a failed read is
 /// not mistaken for idle memory.
 pub fn read(total: u64) -> Option<Memory> {
-    let swap = sys::sysctl_value::<sys::xsw_usage>("vm.swapusage").unwrap_or_default();
+    let swap = sys::sysctl_value::<sys::xsw_usage>("vm.swapusage");
     memory_from(total, vm_statistics(), swap)
 }
 
 fn memory_from(
     total: u64,
     stats: Option<sys::vm_statistics64>,
-    swap: sys::xsw_usage,
+    swap: Option<sys::xsw_usage>,
 ) -> Option<Memory> {
     let stats = stats?;
     // mactop (via gopsutil): everything except free and inactive pages is used.
@@ -19,8 +19,10 @@ fn memory_from(
     Some(Memory {
         used: total.saturating_sub(available),
         total,
-        swap_used: swap.xsu_used,
-        swap_total: swap.xsu_total,
+        swap: swap.map(|swap| Swap {
+            used: swap.xsu_used,
+            total: swap.xsu_total,
+        }),
     })
 }
 
@@ -76,6 +78,27 @@ mod tests {
     #[test]
     fn failed_vm_read_is_no_reading_rather_than_zero_used() {
         // `vm_statistics` returns `None` when the kernel call fails.
-        assert!(memory_from(1 << 34, None, sys::xsw_usage::default()).is_none());
+        assert!(memory_from(1 << 34, None, Some(sys::xsw_usage::default())).is_none());
+    }
+
+    #[test]
+    fn swap_read_carries_used_and_total() {
+        let swap = sys::xsw_usage {
+            xsu_total: 4 << 30,
+            xsu_avail: 3 << 30,
+            xsu_used: 1 << 30,
+            ..sys::xsw_usage::default()
+        };
+        let swap = memory_from(1 << 34, Some(sys::vm_statistics64::default()), Some(swap))
+            .and_then(|memory| memory.swap)
+            .expect("a successful swap read was dropped");
+        assert_eq!((swap.used, swap.total), (1 << 30, 4 << 30));
+    }
+
+    #[test]
+    fn failed_swap_read_is_no_swap_reading_rather_than_zero_swap() {
+        let memory = memory_from(1 << 34, Some(sys::vm_statistics64::default()), None)
+            .expect("a failed swap read discarded the page counts");
+        assert!(memory.swap.is_none());
     }
 }

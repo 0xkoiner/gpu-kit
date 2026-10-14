@@ -1,17 +1,19 @@
 /// Static facts about the machine, read once.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct ChipInfo {
     /// Marketing name, for example `Apple M1 Max`.
     pub name: String,
-    /// In logical CPU order, as [`core_tiers`](super::cpu::core_tiers) reads
-    /// them; empty when macOS reports no performance levels.
+    /// In logical CPU order, which Apple Silicon numbers slowest tier first;
+    /// empty when macOS reports no performance levels.
     pub tiers: Vec<CoreTier>,
     pub gpu_cores: u32,
     pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub enum CoreKind {
     Efficiency,
@@ -22,6 +24,7 @@ pub enum CoreKind {
 
 /// One performance level of the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct CoreTier {
     pub kind: CoreKind,
@@ -30,6 +33,7 @@ pub struct CoreTier {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct CoreUsage {
     pub kind: CoreKind,
@@ -38,6 +42,7 @@ pub struct CoreUsage {
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Cpu {
     pub cores: Vec<CoreUsage>,
@@ -48,6 +53,7 @@ pub struct Cpu {
 
 /// The clock of one core tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct TierClock {
     pub kind: CoreKind,
@@ -67,17 +73,20 @@ impl Cpu {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Gpu {
     /// Active residency, 0–100.
     pub usage: f32,
-    pub mhz: u32,
+    /// `None` without the GPU's frequency table.
+    pub mhz: Option<u32>,
 }
 
 /// Power draw in watts, averaged over the sample interval. A block is `None`
 /// without IOReport, and CPU, ANE and DRAM also while their energy counters
 /// are dead, as macOS 27 betas leave them.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Power {
     pub cpu: Option<f32>,
@@ -100,6 +109,7 @@ impl Power {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Temperatures {
     pub cpu: Option<f32>,
@@ -107,6 +117,7 @@ pub struct Temperatures {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub enum ThermalPressure {
     Nominal,
@@ -147,6 +158,7 @@ impl TryFrom<u64> for ThermalPressure {
 
 /// In bytes.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Memory {
     pub used: u64,
@@ -157,6 +169,7 @@ pub struct Memory {
 
 /// In bytes.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Swap {
     pub used: u64,
@@ -165,6 +178,7 @@ pub struct Swap {
 
 /// Byte rates per second.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Throughput {
     pub read: f64,
@@ -172,6 +186,7 @@ pub struct Throughput {
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Volume {
     pub name: String,
@@ -181,6 +196,7 @@ pub struct Volume {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Battery {
     pub percent: u32,
@@ -188,6 +204,7 @@ pub struct Battery {
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Process {
     pub pid: i32,
@@ -208,6 +225,7 @@ pub struct Process {
 
 /// Everything measured over one sample interval.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Snapshot {
     pub cpu: Cpu,
@@ -236,7 +254,9 @@ pub struct Snapshot {
     pub volumes: Option<Vec<Volume>>,
     pub battery: Option<Battery>,
     pub uptime_secs: u64,
-    pub processes: Vec<Process>,
+    /// `None` while [`Sampler`](crate::Sampler) isn't listing processes, and
+    /// when the process table can't be read.
+    pub processes: Option<Vec<Process>>,
 }
 
 #[cfg(test)]

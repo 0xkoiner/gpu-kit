@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::modules::metrics::cf;
-use crate::modules::metrics::rate::{ByteCounts, ByteRates};
-use crate::modules::metrics::snapshot::Throughput;
+use crate::cf;
+use crate::rate::{ByteCounts, ByteRates};
+use crate::snapshot::Throughput;
 
 /// Read/write byte counters of each physical block storage driver; rates come from deltas.
 #[derive(Default)]

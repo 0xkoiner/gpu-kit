@@ -3,5 +3,10 @@ name = "gpu-ui"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["src/modules/metrics"]
+
 [dependencies]
 gpui-kit = "0.7.3"
+serde_json = "1.0.154"
+top-metrics = { path = "src/modules/metrics", features = ["serde"] }

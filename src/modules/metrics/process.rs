@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int};
 use std::time::Instant;
 
-use crate::modules::metrics::cf;
-use crate::modules::metrics::snapshot::Process;
-use crate::modules::metrics::sys::{self, read_i32, read_i64};
+use crate::cf;
+use crate::snapshot::Process;
+use crate::sys::{self, read_i32, read_i64};
 
 /// A pid is reused after exit; the start time tells the two processes apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

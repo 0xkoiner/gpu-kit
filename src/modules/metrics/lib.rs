@@ -1,10 +1,14 @@
 //! Apple Silicon system metrics, sampled the way mactop does, through raw
 //! FFI to IOKit, CoreFoundation, libIOReport and libSystem. No crate
-//! dependencies and no root: IOReport, the SMC, libproc and sysctl are all
-//! readable by an ordinary user outside an app sandbox.
+//! dependencies (the `serde` feature adds `Serialize` to the snapshot types)
+//! and no root: IOReport, the SMC, libproc and sysctl are all readable by an
+//! ordinary user outside an app sandbox.
 #![cfg(target_os = "macos")]
 
-mod cf;
+// Public only so their doctests, which prove the safe wrappers can't be
+// misused, can reach them; not part of the API.
+#[doc(hidden)]
+pub mod cf;
 mod cpu;
 mod disk;
 mod ioreport;
@@ -14,7 +18,8 @@ mod process;
 mod rate;
 mod smc;
 mod snapshot;
-mod sys;
+#[doc(hidden)]
+pub mod sys;
 mod system;
 mod volumes;
 
@@ -33,7 +38,8 @@ pub const ANE_FULL_LOAD_WATTS: f32 = 8.0;
 const TEMPERATURE_MAX_AGE: Duration = Duration::from_secs(5);
 
 /// Owns every counter whose rate needs a previous reading. Rates cover the
-/// time between two `sample` calls; the first call returns zeros for them.
+/// time between two `sample` calls, so the first call has none (`None`);
+/// [`Sampler::new`] makes that call.
 pub struct Sampler {
     chip: ChipInfo,
     cpu: cpu::CpuTicks,
@@ -94,57 +100,43 @@ impl Sampler {
 
     pub fn sample(&mut self) -> Snapshot {
         let core_usage = self.cpu.sample();
-        let cores = cpu::label_cores(&core_usage, self.chip.efficiency_cores);
-        let cpu_usage = if core_usage.is_empty() {
-            0.0
-        } else {
-            core_usage.iter().sum::<f32>() / core_usage.len() as f32
-        };
+        let cores = cpu::label_cores(&core_usage, &self.chip.tiers);
 
         let reading = self.ioreport.as_mut().and_then(|io| io.sample());
         if let Some(reading) = &reading {
             self.energy_dead = energy_counters_dead(&reading.energy, self.energy_dead);
         }
-        let energy = reading.map(|reading| reading.energy);
+        let energy = reading.as_ref().map(|reading| reading.energy);
         let live = energy.filter(|_| !self.energy_dead);
-        let reading = reading.unwrap_or_default();
         let power = Power {
             cpu: live.and_then(|e| e.cpu),
             gpu: energy.and_then(|e| Some(e.gpu? + e.gpu_sram.unwrap_or(0.0))),
             ane: live.and_then(|e| e.ane),
             dram: live.and_then(|e| e.dram),
-            system: 0.0,
+            system: self.smc.as_ref().and_then(|smc| smc.system_power()),
         };
-        let package: f32 = [power.cpu, power.gpu, power.ane, power.dram]
-            .into_iter()
-            .flatten()
-            .sum();
         let temperatures = self.temperatures();
-        let measured_system = self
-            .smc
-            .as_ref()
-            .and_then(|smc| smc.system_power())
-            .unwrap_or(0.0);
 
         Snapshot {
             cpu: Cpu {
-                usage: cpu_usage,
                 cores,
-                efficiency_mhz: reading.efficiency_mhz,
-                performance_mhz: reading.performance_mhz,
+                clocks: reading
+                    .as_ref()
+                    .map(|reading| reading.tier_clocks(&self.chip.tiers))
+                    .unwrap_or_default(),
             },
-            gpu: Gpu {
-                usage: reading.gpu_usage,
-                mhz: reading.gpu_mhz,
-            },
+            gpu: reading
+                .as_ref()
+                .and_then(|reading| reading.gpu)
+                .map(|gpu| Gpu {
+                    usage: gpu.usage,
+                    mhz: gpu.mhz,
+                }),
             ane: power
                 .ane
                 .map(|watts| (watts / ANE_FULL_LOAD_WATTS * 100.0).clamp(0.0, 100.0)),
-            ane_traffic: reading.ane_traffic,
-            power: Power {
-                system: measured_system.max(package),
-                ..power
-            },
+            ane_traffic: reading.as_ref().and_then(|reading| reading.ane_traffic),
+            power,
             temperatures,
             thermal: system::thermal_pressure(),
             memory: memory::read(self.chip.memory_bytes),
@@ -156,7 +148,7 @@ impl Sampler {
             processes: if self.lists_processes {
                 self.processes.sample(self.chip.memory_bytes)
             } else {
-                Vec::new()
+                None
             },
         }
     }

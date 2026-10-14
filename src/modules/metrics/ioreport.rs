@@ -6,11 +6,11 @@ use std::ffi::c_void;
 use std::ptr;
 use std::time::Instant;
 
-use crate::modules::metrics::cf::{
+use crate::cf::{
     self, CFDictionaryRef, CFMutableDictionaryRef, CFOwned, CFStringRef, CFType, CFTypeRef,
     io_object_t,
 };
-use crate::modules::metrics::snapshot::{CoreTier, TierClock};
+use crate::snapshot::{CoreTier, TierClock};
 
 type IOReportSubscriptionRef = *const c_void;
 
@@ -556,7 +556,7 @@ fn parse_voltage_states(bytes: &[u8]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::metrics::snapshot::CoreKind;
+    use crate::snapshot::CoreKind;
 
     fn named(states: &[(&str, i64)]) -> Vec<(String, i64)> {
         states

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::time::Instant;
 
-use crate::modules::metrics::rate::{ByteCounts, ByteRates};
-use crate::modules::metrics::snapshot::Throughput;
-use crate::modules::metrics::sys::{self, ifmibdata};
+use crate::rate::{ByteCounts, ByteRates};
+use crate::snapshot::Throughput;
+use crate::sys::{self, ifmibdata};
 
 /// 64-bit byte counters of each interface that carries its own traffic;
 /// rates come from deltas.

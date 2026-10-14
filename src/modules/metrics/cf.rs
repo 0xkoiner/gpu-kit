@@ -117,7 +117,7 @@ impl CFType {
     ///
     /// # Safety
     /// `cf` must be null or a CF object that stays alive for `'a`.
-    unsafe fn borrowed<'a>(cf: CFTypeRef) -> Option<&'a Self> {
+    pub unsafe fn borrowed<'a>(cf: CFTypeRef) -> Option<&'a Self> {
         unsafe { cf.cast::<Self>().as_ref() }
     }
 
@@ -300,10 +300,24 @@ unsafe extern "C" {
 /// copying a whole property table is costly.
 pub fn for_each_service(class: &str, visit: impl FnMut(io_object_t)) -> bool {
     let class = CString::new(class).expect("class without NUL");
+    unsafe { for_each_match(IOServiceMatching(class.as_ptr()), visit) }
+}
+
+/// As [`for_each_service`], for the entries IOKit name-matches to `name`: by
+/// their name, or a device-tree node's `compatible` entry.
+pub fn for_each_named_service(name: &str, visit: impl FnMut(io_object_t)) -> bool {
+    let name = CString::new(name).expect("name without NUL");
+    unsafe { for_each_match(IOServiceNameMatching(name.as_ptr()), visit) }
+}
+
+/// Visits the services `matching` finds, as [`for_each_service`] does.
+///
+/// # Safety
+/// `matching` must be null or a +1 matching dictionary, which this consumes.
+unsafe fn for_each_match(matching: CFMutableDictionaryRef, visit: impl FnMut(io_object_t)) -> bool {
     let mut iter: io_iterator_t = 0;
     unsafe {
         // `IOServiceGetMatchingServices` consumes the matching dictionary.
-        let matching = IOServiceMatching(class.as_ptr());
         if matching.is_null()
             || IOServiceGetMatchingServices(kIOMainPortDefault, matching, &mut iter) != 0
         {

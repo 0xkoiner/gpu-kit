@@ -1,8 +1,10 @@
 //! Minimal CoreFoundation and IOKit bindings plus safe owning wrappers.
-#![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
+#![allow(non_camel_case_types, non_upper_case_globals)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::ptr;
+use std::marker::{PhantomData, PhantomPinned};
+use std::ops::Deref;
+use std::ptr::NonNull;
 
 pub type CFTypeRef = *const c_void;
 pub type CFAllocatorRef = *const c_void;
@@ -22,8 +24,17 @@ pub const kCFNumberSInt32Type: CFNumberType = 3;
 pub const kCFNumberSInt64Type: CFNumberType = 4;
 pub const kCFNumberDoubleType: CFNumberType = 13;
 
+/// An opaque CoreFoundation object. Readers take `&CFType`, so anything they
+/// borrow out of it is tied to that reference's lifetime. Raw FFI that mutates
+/// an object must not run while such borrows are live.
+#[repr(C)]
+pub struct CFType {
+    _data: [u8; 0],
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
+}
+
 /// An owned CoreFoundation object, released on drop.
-pub struct CFOwned(CFTypeRef);
+pub struct CFOwned(NonNull<CFType>);
 
 // IOKit
 pub type io_object_t = u32;
@@ -63,6 +74,11 @@ unsafe extern "C" {
         encoding: CFStringEncoding,
     ) -> u8;
     pub fn CFStringGetCStringPtr(string: CFStringRef, encoding: CFStringEncoding) -> *const c_char;
+    pub fn CFStringGetLength(string: CFStringRef) -> CFIndex;
+    pub fn CFStringGetMaximumSizeForEncoding(
+        length: CFIndex,
+        encoding: CFStringEncoding,
+    ) -> CFIndex;
 
     pub fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
     pub fn CFDictionaryGetCount(dict: CFDictionaryRef) -> CFIndex;
@@ -93,35 +109,64 @@ unsafe extern "C" {
     pub fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
 }
 
+impl CFType {
+    /// Borrows a +0 reference (from a `Get` call) for the caller-chosen `'a`.
+    ///
+    /// # Safety
+    /// `cf` must be null or a CF object that stays alive for `'a`.
+    unsafe fn borrowed<'a>(cf: CFTypeRef) -> Option<&'a Self> {
+        unsafe { cf.cast::<Self>().as_ref() }
+    }
+
+    pub fn as_ptr(&self) -> CFTypeRef {
+        (self as *const Self).cast()
+    }
+}
+
 impl CFOwned {
     /// Takes ownership of a +1 reference (from a `Create`/`Copy` call).
-    pub fn new(cf: CFTypeRef) -> Option<Self> {
-        // `then`, not `then_some`: an eagerly built owner would CFRelease(NULL) on drop.
-        (!cf.is_null()).then(|| Self(cf))
+    ///
+    /// # Safety
+    /// `cf` must be null or a +1 reference to a live CF object that nothing
+    /// else will release. Dictionaries and arrays must hold only CF objects,
+    /// as those built with the `kCFType` callbacks do.
+    pub unsafe fn new(cf: CFTypeRef) -> Option<Self> {
+        NonNull::new(cf.cast_mut().cast()).map(Self)
     }
 
     pub fn string(text: &str) -> Self {
         let text = CString::new(text).expect("CF string without NUL");
+        // A `Create` call hands back a +1 reference.
         let cf = unsafe {
-            CFStringCreateWithCString(kCFAllocatorDefault, text.as_ptr(), kCFStringEncodingUTF8)
+            Self::new(CFStringCreateWithCString(
+                kCFAllocatorDefault,
+                text.as_ptr(),
+                kCFStringEncodingUTF8,
+            ))
         };
-        Self(cf)
+        cf.expect("CFStringCreateWithCString returned NULL")
     }
+}
 
-    pub fn as_ptr(&self) -> CFTypeRef {
-        self.0
+impl Deref for CFOwned {
+    type Target = CFType;
+
+    fn deref(&self) -> &CFType {
+        // `new`'s contract keeps the object alive while we own it.
+        unsafe { self.0.as_ref() }
     }
 }
 
 impl Drop for CFOwned {
     fn drop(&mut self) {
-        unsafe { CFRelease(self.0) };
+        unsafe { CFRelease(self.as_ptr()) };
     }
 }
 
 /// Reads a CFString into a Rust `String`.
-pub fn string(cf: CFTypeRef) -> Option<String> {
-    if cf.is_null() || unsafe { CFGetTypeID(cf) != CFStringGetTypeID() } {
+pub fn string(cf: &CFType) -> Option<String> {
+    let cf = cf.as_ptr();
+    if unsafe { CFGetTypeID(cf) != CFStringGetTypeID() } {
         return None;
     }
     unsafe {
@@ -129,7 +174,9 @@ pub fn string(cf: CFTypeRef) -> Option<String> {
         if !direct.is_null() {
             return Some(CStr::from_ptr(direct).to_string_lossy().into_owned());
         }
-        let mut buf = [0 as c_char; 256];
+        // Worst-case UTF-8 size plus the NUL; negative means the size overflowed.
+        let max = CFStringGetMaximumSizeForEncoding(CFStringGetLength(cf), kCFStringEncodingUTF8);
+        let mut buf = vec![0 as c_char; usize::try_from(max).ok()?.checked_add(1)?];
         (CFStringGetCString(
             cf,
             buf.as_mut_ptr(),
@@ -141,8 +188,9 @@ pub fn string(cf: CFTypeRef) -> Option<String> {
 }
 
 /// Reads a CFNumber as `i64`.
-pub fn number_i64(cf: CFTypeRef) -> Option<i64> {
-    if cf.is_null() || unsafe { CFGetTypeID(cf) != CFNumberGetTypeID() } {
+pub fn number_i64(cf: &CFType) -> Option<i64> {
+    let cf = cf.as_ptr();
+    if unsafe { CFGetTypeID(cf) != CFNumberGetTypeID() } {
         return None;
     }
     let mut value = 0i64;
@@ -150,21 +198,34 @@ pub fn number_i64(cf: CFTypeRef) -> Option<i64> {
         .then_some(value)
 }
 
-pub fn is_true(cf: CFTypeRef) -> bool {
-    !cf.is_null() && unsafe { cf == kCFBooleanTrue }
+pub fn is_true(cf: &CFType) -> bool {
+    unsafe { cf.as_ptr() == kCFBooleanTrue }
 }
 
-/// Looks up `key` in a CFDictionary; the result is borrowed from `dict`.
-pub fn dict_get(dict: CFDictionaryRef, key: &str) -> CFTypeRef {
-    if dict.is_null() {
-        return ptr::null();
+/// Looks up `key` in a CFDictionary; the value borrows from `dict`.
+pub fn dict_get<'a>(dict: &'a CFType, key: &str) -> Option<&'a CFType> {
+    if unsafe { CFGetTypeID(dict.as_ptr()) != CFDictionaryGetTypeID() } {
+        return None;
     }
     let key = CFOwned::string(key);
-    unsafe { CFDictionaryGetValue(dict, key.as_ptr()) }
+    // The dictionary retains its values (see `CFOwned::new`), so they live as long as `dict`.
+    unsafe { CFType::borrowed(CFDictionaryGetValue(dict.as_ptr(), key.as_ptr())) }
 }
 
-pub fn data_bytes<'a>(cf: CFTypeRef) -> Option<&'a [u8]> {
-    if cf.is_null() || unsafe { CFGetTypeID(cf) != CFDataGetTypeID() } {
+/// Reads the bytes of a CFData. The slice borrows from `cf`, so it can't
+/// outlive the object:
+///
+/// ```compile_fail,E0597
+/// use gpu_ui::modules::metrics::cpu::{CFOwned, data_bytes};
+/// let bytes = {
+///     let data = CFOwned::string("released at the end of this block");
+///     data_bytes(&data)
+/// };
+/// println!("{bytes:?}");
+/// ```
+pub fn data_bytes(cf: &CFType) -> Option<&[u8]> {
+    let cf = cf.as_ptr();
+    if unsafe { CFGetTypeID(cf) != CFDataGetTypeID() } {
         return None;
     }
     unsafe {
@@ -268,17 +329,122 @@ unsafe fn visit_iterator(iter: io_iterator_t, mut visit: impl FnMut(io_object_t)
 /// One property of a registry entry.
 pub fn property(entry: io_registry_entry_t, key: &str) -> Option<CFOwned> {
     let key = CFOwned::string(key);
-    CFOwned::new(unsafe {
-        IORegistryEntryCreateCFProperty(entry, key.as_ptr(), kCFAllocatorDefault, 0)
-    })
+    // A `Create` call hands back a +1 reference.
+    unsafe {
+        CFOwned::new(IORegistryEntryCreateCFProperty(
+            entry,
+            key.as_ptr(),
+            kCFAllocatorDefault,
+            0,
+        ))
+    }
 }
 
-/// Iterates the items of a CFArray; yields nothing for any other type.
-pub fn array_items(array: CFTypeRef) -> impl Iterator<Item = CFTypeRef> {
-    let count = if !array.is_null() && unsafe { CFGetTypeID(array) == CFArrayGetTypeID() } {
-        unsafe { CFArrayGetCount(array) }
+/// Iterates the items of a CFArray, borrowed from `array`; yields nothing for
+/// any other type.
+pub fn array_items(array: &CFType) -> impl Iterator<Item = &CFType> {
+    let count = if unsafe { CFGetTypeID(array.as_ptr()) == CFArrayGetTypeID() } {
+        unsafe { CFArrayGetCount(array.as_ptr()) }
     } else {
         0
     };
-    (0..count).map(move |ix| unsafe { CFArrayGetValueAtIndex(array, ix) })
+    // The array retains its items (see `CFOwned::new`), so they live as long as `array`.
+    (0..count).filter_map(move |ix| unsafe {
+        CFType::borrowed(CFArrayGetValueAtIndex(array.as_ptr(), ix))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" {
+        static kCFTypeArrayCallBacks: c_void;
+
+        fn CFDataCreate(alloc: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+        fn CFArrayCreate(
+            alloc: CFAllocatorRef,
+            values: *const CFTypeRef,
+            count: CFIndex,
+            callbacks: *const c_void,
+        ) -> CFArrayRef;
+    }
+
+    fn cf_array(items: &[&str]) -> CFOwned {
+        let items: Vec<CFOwned> = items.iter().map(|item| CFOwned::string(item)).collect();
+        let ptrs: Vec<CFTypeRef> = items.iter().map(|item| item.as_ptr()).collect();
+        let cf = unsafe {
+            CFArrayCreate(
+                kCFAllocatorDefault,
+                ptrs.as_ptr(),
+                ptrs.len() as CFIndex,
+                (&raw const kCFTypeArrayCallBacks).cast(),
+            )
+        };
+        unsafe { CFOwned::new(cf) }.expect("CFArrayCreate")
+    }
+
+    #[test]
+    fn array_items_borrows_items_from_the_array() {
+        let array = cf_array(&["gpu", "cpu"]);
+        let items: Vec<String> = array_items(&array).filter_map(string).collect();
+        assert_eq!(items, ["gpu", "cpu"]);
+    }
+
+    fn cf_data(bytes: &[u8]) -> CFOwned {
+        let cf =
+            unsafe { CFDataCreate(kCFAllocatorDefault, bytes.as_ptr(), bytes.len() as CFIndex) };
+        unsafe { CFOwned::new(cf) }.expect("CFDataCreate")
+    }
+
+    fn cf_dict(key: &str, value: i64) -> CFOwned {
+        unsafe {
+            let dict = CFDictionaryCreateMutable(
+                kCFAllocatorDefault,
+                0,
+                (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
+                (&raw const kCFTypeDictionaryValueCallBacks).cast(),
+            );
+            let dict = CFOwned::new(dict).expect("CFDictionaryCreateMutable");
+            let value = CFNumberCreate(
+                kCFAllocatorDefault,
+                kCFNumberSInt64Type,
+                (&raw const value).cast(),
+            );
+            let value = CFOwned::new(value).expect("CFNumberCreate");
+            CFDictionarySetValue(
+                dict.as_ptr().cast_mut(),
+                CFOwned::string(key).as_ptr(),
+                value.as_ptr(),
+            );
+            dict
+        }
+    }
+
+    #[test]
+    fn dict_get_borrows_values_from_the_dictionary() {
+        let dict = cf_dict("cores", 10);
+        assert_eq!(dict_get(&dict, "cores").and_then(number_i64), Some(10));
+        assert!(dict_get(&dict, "missing").is_none());
+    }
+
+    #[test]
+    fn dict_get_returns_none_for_a_non_dictionary() {
+        let text = CFOwned::string("not a dictionary");
+        assert!(dict_get(&text, "cores").is_none());
+    }
+
+    #[test]
+    fn data_bytes_reads_an_owned_cfdata() {
+        let data = cf_data(b"gpu");
+        assert_eq!(data_bytes(&data), Some(&b"gpu"[..]));
+    }
+
+    #[test]
+    fn string_reads_long_text_through_the_copy_path() {
+        // Non-ASCII forces the copy path: CF has no direct UTF-8 pointer for it.
+        let text = "é".repeat(200);
+        let cf = CFOwned::string(&text);
+        assert_eq!(string(&cf), Some(text));
+    }
 }

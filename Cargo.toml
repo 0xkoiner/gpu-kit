@@ -9,9 +9,3 @@ members = ["src/modules/metrics"]
 [dependencies]
 serde_json = "1.0.154"
 top-metrics = { path = "src/modules/metrics", features = ["serde"] }
-
-# The UI toolkit. Nothing uses it yet, and on Linux it needs the X11, Wayland
-# and font development packages, so the metrics dump builds without it there.
-# Move it back to [dependencies] when the UI targets Linux.
-[target.'cfg(target_os = "macos")'.dependencies]
-gpui-kit = "0.7.3"

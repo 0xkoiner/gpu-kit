@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::{amdgpu, nvml};
+use crate::{amdgpu, nvml};
 
 /// One GPU's readings; `None` where its driver doesn't report a value.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]

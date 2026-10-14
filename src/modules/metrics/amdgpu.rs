@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::files;
-use super::gpu::DeviceSample;
+use crate::files;
+use crate::gpu::DeviceSample;
 
 const DRM: &str = "/sys/class/drm";
 

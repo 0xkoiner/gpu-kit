@@ -7,9 +7,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::{files, sys};
-use crate::signal::{Signal, SignalError};
 use crate::snapshot::Process;
+use crate::{files, sys};
 
 /// A pid is reused after exit; the start time tells the two processes apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -229,6 +228,22 @@ fn parse_passwd(passwd: &str) -> HashMap<u32, String> {
             Some((uid, name.to_owned()))
         })
         .collect()
+}
+
+/// Why a signal could not be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalError {
+    /// The process belongs to another user or to the system.
+    NotPermitted,
+    /// The process already exited.
+    NoSuchProcess,
+    Other(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Terminate,
+    Kill,
 }
 
 /// Signals the process `pid` only while it is still the one that started at

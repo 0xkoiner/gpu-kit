@@ -5,8 +5,8 @@ use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{files, sys};
 use crate::snapshot::Volume;
+use crate::{files, sys};
 
 const MOUNTS: &str = "/proc/self/mounts";
 const BY_LABEL: &str = "/dev/disk/by-label";

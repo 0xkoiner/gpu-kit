@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::files;
+use crate::files;
 use crate::snapshot::ThermalPressure;
 
 const THERMAL: &str = "/sys/class/thermal";

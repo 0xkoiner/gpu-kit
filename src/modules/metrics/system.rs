@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{cpu, files, memory};
 use crate::snapshot::{Battery, ChipInfo};
+use crate::{cpu, files, memory};
 
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
 

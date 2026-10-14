@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use super::files;
-use crate::snapshot::{CoreKind, CoreTier, TierClock};
+use crate::files;
+use crate::snapshot::{CoreKind, CoreTier, CoreUsage, TierClock};
 
 const CPUS: &str = "/sys/devices/system/cpu";
 
@@ -171,6 +171,21 @@ fn tiers_from(count: usize, speeds: Option<&[u64]>) -> Vec<CoreTier> {
     tiers
 }
 
+/// Labels logical CPUs by the tier each falls in, `tiers` being in logical
+/// CPU order as [`core_tiers`] returns them. Cores no tier covers count as
+/// Performance.
+pub fn label_cores(usage: &[f32], tiers: &[CoreTier]) -> Vec<CoreUsage> {
+    let kinds = tiers
+        .iter()
+        .flat_map(|tier| std::iter::repeat_n(tier.kind, tier.cores as usize))
+        .chain(std::iter::repeat(CoreKind::Performance));
+    usage
+        .iter()
+        .zip(kinds)
+        .map(|(&usage, kind)| CoreUsage { kind, usage })
+        .collect()
+}
+
 /// The clock of each tier in MHz: the mean of its cores' `scaling_cur_freq`
 /// or, without cpufreq (VMs rarely have it), of the `cpu MHz` /proc/cpuinfo
 /// prints for x86. Empty unless every tier's clock is known, so the list
@@ -325,6 +340,38 @@ btime 1791984757
                 (CoreKind::Efficiency, 1),
                 (CoreKind::Super, 1)
             ]
+        );
+    }
+
+    #[test]
+    fn cores_take_their_tier_in_order_and_the_rest_count_as_performance() {
+        let tiers = [
+            CoreTier {
+                kind: CoreKind::Efficiency,
+                cores: 2,
+            },
+            CoreTier {
+                kind: CoreKind::Super,
+                cores: 1,
+            },
+        ];
+        let kinds: Vec<CoreKind> = label_cores(&[1.0, 2.0, 3.0, 4.0], &tiers)
+            .iter()
+            .map(|core| core.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                CoreKind::Efficiency,
+                CoreKind::Efficiency,
+                CoreKind::Super,
+                CoreKind::Performance
+            ]
+        );
+        assert!(
+            label_cores(&[1.0], &[])
+                .iter()
+                .all(|core| core.kind == CoreKind::Performance)
         );
     }
 

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use super::files;
+use crate::files;
 
 const POWERCAP: &str = "/sys/class/powercap";
 

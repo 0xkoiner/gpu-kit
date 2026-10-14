@@ -3,12 +3,11 @@
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct ChipInfo {
-    /// Marketing name, for example `Apple M1 Max`.
+    /// The CPU's model name, for example `Intel(R) Xeon(R) Platinum 8259CL CPU
+    /// @ 2.50GHz`, or the core an ARM chip is built on.
     pub name: String,
-    /// In logical CPU order. Apple Silicon numbers its slowest tier first;
-    /// Linux groups cores by the speed the kernel gives them, and a chip whose
-    /// cores are all alike has one tier. Empty when the OS reports no levels at
-    /// all, as on an Intel Mac.
+    /// In logical CPU order, a tier being a run of cores of one speed; a chip
+    /// whose cores are all alike has one. Empty when no CPU is reported.
     pub tiers: Vec<CoreTier>,
     pub gpu_cores: u32,
     pub memory_bytes: u64,
@@ -20,7 +19,7 @@ pub struct ChipInfo {
 pub enum CoreKind {
     Efficiency,
     Performance,
-    /// The tier above Performance, as on the M5 Pro.
+    /// The tier above Performance, where a chip has three.
     Super,
 }
 
@@ -49,7 +48,8 @@ pub struct CoreUsage {
 pub struct Cpu {
     pub cores: Vec<CoreUsage>,
     /// One per core tier, in [`ChipInfo::tiers`] order, since two tiers can
-    /// share a kind; empty without IOReport (macOS) or cpufreq (Linux).
+    /// share a kind; empty without cpufreq when /proc/cpuinfo has no clocks
+    /// either.
     pub clocks: Vec<TierClock>,
 }
 
@@ -78,39 +78,35 @@ impl Cpu {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Gpu {
-    /// Active residency, 0–100.
+    /// Busy share, 0–100.
     pub usage: f32,
-    /// `None` without the GPU's frequency table.
+    /// `None` where the driver reports no clock.
     pub mhz: Option<u32>,
 }
 
-/// Power draw in watts, averaged over the sample interval. On macOS a block
-/// is `None` without IOReport, and CPU, ANE and DRAM also while their energy
-/// counters are dead, as macOS 27 betas leave them. On Linux CPU and DRAM come
-/// from RAPL, which VMs rarely expose and recent kernels open to root alone,
-/// GPU from its driver, and ANE is always `None`.
+/// Power draw in watts, averaged over the sample interval. CPU and DRAM come
+/// from RAPL, which VMs rarely expose and recent kernels open to root alone;
+/// GPU from its driver. A block is `None` where it can't be read.
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct Power {
     pub cpu: Option<f32>,
     pub gpu: Option<f32>,
-    pub ane: Option<f32>,
     pub dram: Option<f32>,
-    /// Whole-system draw, where the machine meters it: the SMC on a Mac;
-    /// RAPL's `psys` domain or, on battery, the battery's discharge on Linux.
-    /// `None` elsewhere.
+    /// Whole-system draw, where the machine meters it: RAPL's `psys` domain
+    /// or, on battery, the battery's discharge. `None` elsewhere.
     pub system: Option<f32>,
 }
 
 impl Power {
-    /// The SMC's whole-system draw when it reports one, otherwise the sum of
-    /// the CPU, GPU, ANE and DRAM blocks, which leaves out the rest of the
-    /// machine. `None` when a block is missing, so a dead counter can't
-    /// shrink that sum unnoticed.
+    /// The metered whole-system draw when there is one, otherwise the sum of
+    /// the CPU, GPU and DRAM blocks, which leaves out the rest of the machine.
+    /// `None` when a block is missing, so an unread counter can't shrink that
+    /// sum unnoticed.
     pub fn total(&self) -> Option<f32> {
         self.system
-            .or_else(|| Some(self.cpu? + self.gpu? + self.ane? + self.dram?))
+            .or_else(|| Some(self.cpu? + self.gpu? + self.dram?))
     }
 }
 
@@ -122,9 +118,9 @@ pub struct Temperatures {
     pub gpu: Option<f32>,
 }
 
-/// How hard the kernel is holding temperatures down. macOS reports it as
-/// such; Linux has no such level, so it's read off the thermal zones' trip
-/// points there, and Sleeping is never reported.
+/// How hard the kernel is holding temperatures down, read off its thermal
+/// zones' trip points: Moderate past a `passive` trip, Heavy past `hot`,
+/// Trapping past `critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
@@ -133,7 +129,6 @@ pub enum ThermalPressure {
     Moderate,
     Heavy,
     Trapping,
-    Sleeping,
 }
 
 impl ThermalPressure {
@@ -143,24 +138,6 @@ impl ThermalPressure {
             Self::Moderate => "Moderate",
             Self::Heavy => "Heavy",
             Self::Trapping => "Trapping",
-            Self::Sleeping => "Sleeping",
-        }
-    }
-}
-
-/// From the `com.apple.system.thermalpressurelevel` notify state, whose
-/// levels <libkern/OSThermalNotification.h> numbers 0–4 on macOS.
-impl TryFrom<u64> for ThermalPressure {
-    type Error = u64;
-
-    fn try_from(state: u64) -> Result<Self, Self::Error> {
-        match state {
-            0 => Ok(Self::Nominal),
-            1 => Ok(Self::Moderate),
-            2 => Ok(Self::Heavy),
-            3 => Ok(Self::Trapping),
-            4 => Ok(Self::Sleeping),
-            unknown => Err(unknown),
         }
     }
 }
@@ -172,7 +149,7 @@ impl TryFrom<u64> for ThermalPressure {
 pub struct Memory {
     pub used: u64,
     pub total: u64,
-    /// `None` when `vm.swapusage` can't be read.
+    /// `None` when /proc/meminfo has no swap figures.
     pub swap: Option<Swap>,
 }
 
@@ -223,8 +200,8 @@ pub struct Process {
     pub command: String,
     /// Share of one core, so a busy multi-threaded process can exceed 100.
     pub cpu: f32,
-    /// Share of the GPU's busy time, 0–100. On Linux only NVML reports it; 0
-    /// otherwise.
+    /// Share of the GPU's busy time, 0–100; only NVML reports it, so 0
+    /// elsewhere.
     pub gpu: f32,
     /// Resident memory as a share of physical memory, 0–100.
     pub memory: f32,
@@ -239,21 +216,13 @@ pub struct Process {
 #[non_exhaustive]
 pub struct Snapshot {
     pub cpu: Cpu,
-    /// `None` without IOReport (macOS) or a GPU driver's telemetry (Linux).
+    /// `None` without a GPU driver's telemetry (NVML or amdgpu).
     pub gpu: Option<Gpu>,
-    /// Neural Engine load, 0–100, estimated from its power draw: Apple
-    /// exposes no occupancy counter. `None` without a power reading, so always
-    /// on Linux.
-    pub ane: Option<f32>,
-    /// Bytes per second the Neural Engine moved through memory; `None` where
-    /// the chip has no such counter.
-    pub ane_traffic: Option<f64>,
     pub power: Power,
     pub temperatures: Temperatures,
-    /// `None` when the notify state can't be read or is a level macOS
-    /// doesn't define; on Linux, without thermal zones, as in a VM.
+    /// `None` without thermal zones, as in a VM.
     pub thermal: Option<ThermalPressure>,
-    /// `None` when the kernel's page counts can't be read.
+    /// `None` when /proc/meminfo can't be read.
     pub memory: Option<Memory>,
     /// `read` is received, `write` is sent. `None` on the first sample, which
     /// only sets the baseline, and when the interface counters can't be read.
@@ -298,63 +267,43 @@ mod tests {
         assert_eq!(cpu_with_shares(&[]).usage(), None);
     }
 
-    /// CPU, GPU, ANE and DRAM draw, in that order.
-    const BLOCKS: [Option<f32>; 4] = [Some(4.0), Some(2.0), Some(0.5), Some(1.0)];
+    /// CPU, GPU and DRAM draw, in that order.
+    const BLOCKS: [Option<f32>; 3] = [Some(4.0), Some(2.0), Some(1.0)];
 
-    fn power_without_smc([cpu, gpu, ane, dram]: [Option<f32>; 4]) -> Power {
+    fn power_without_meter([cpu, gpu, dram]: [Option<f32>; 3]) -> Power {
         Power {
             cpu,
             gpu,
-            ane,
             dram,
             system: None,
         }
     }
 
     #[test]
-    fn power_total_is_the_smc_reading_when_there_is_one() {
+    fn power_total_is_the_metered_draw_when_there_is_one() {
         let power = Power {
             system: Some(30.0),
-            ..power_without_smc(BLOCKS)
+            ..power_without_meter(BLOCKS)
         };
         assert_eq!(power.total(), Some(30.0));
     }
 
     #[test]
-    fn power_total_without_smc_is_the_sum_of_all_four_blocks() {
-        assert_eq!(power_without_smc(BLOCKS).total(), Some(7.5));
+    fn power_total_without_a_meter_is_the_sum_of_all_three_blocks() {
+        assert_eq!(power_without_meter(BLOCKS).total(), Some(7.0));
     }
 
     #[test]
-    fn power_total_without_smc_and_with_a_dead_counter_is_no_reading() {
-        // macOS 27 betas leave the CPU, ANE and DRAM energy counters dead.
+    fn power_total_without_a_meter_and_with_an_unread_block_is_no_reading() {
+        // RAPL may be closed to us, or the GPU driver absent.
         for dead in 0..BLOCKS.len() {
             let mut blocks = BLOCKS;
             blocks[dead] = None;
-            assert_eq!(power_without_smc(blocks).total(), None, "block {dead} dead");
-        }
-    }
-
-    #[test]
-    fn thermal_pressure_maps_the_macos_notify_levels() {
-        // `OSThermalPressureLevel` in <libkern/OSThermalNotification.h>, macOS branch.
-        let levels = [
-            (0, ThermalPressure::Nominal),
-            (1, ThermalPressure::Moderate),
-            (2, ThermalPressure::Heavy),
-            (3, ThermalPressure::Trapping),
-            (4, ThermalPressure::Sleeping),
-        ];
-        for (state, level) in levels {
-            assert_eq!(ThermalPressure::try_from(state), Ok(level), "state {state}");
-        }
-    }
-
-    #[test]
-    fn unknown_thermal_level_is_rejected_rather_than_read_as_nominal() {
-        // 10 is `Light` in the iOS numbering, which macOS doesn't use.
-        for state in [5, 10, u64::MAX] {
-            assert_eq!(ThermalPressure::try_from(state), Err(state));
+            assert_eq!(
+                power_without_meter(blocks).total(),
+                None,
+                "block {dead} unread"
+            );
         }
     }
 }

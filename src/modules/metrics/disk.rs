@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use super::files;
+use crate::files;
 use crate::rate::{ByteCounts, ByteRates};
 use crate::snapshot::Throughput;
 

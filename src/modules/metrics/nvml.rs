@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_uint, c_ulonglong, c_void};
 use std::ptr;
 
-use super::gpu::DeviceSample;
-use super::sys;
+use crate::gpu::DeviceSample;
+use crate::sys;
 
 type Device = *mut c_void;
 

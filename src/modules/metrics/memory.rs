@@ -1,6 +1,6 @@
 //! Memory and swap from /proc/meminfo.
 
-use super::files;
+use crate::files;
 use crate::snapshot::{Memory, Swap};
 
 /// `None` when /proc/meminfo can't be read or has no `MemAvailable`

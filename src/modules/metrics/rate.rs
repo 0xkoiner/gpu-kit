@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Instant;
 
-use crate::modules::metrics::snapshot::Throughput;
+use crate::snapshot::Throughput;
 
 /// Bytes one device has read and written since it appeared.
 #[derive(Debug, Clone, Copy, Default)]

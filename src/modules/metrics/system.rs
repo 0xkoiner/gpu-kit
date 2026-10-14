@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::modules::metrics::cf;
-use crate::modules::metrics::cpu;
-use crate::modules::metrics::snapshot::{Battery, ChipInfo, ThermalPressure};
-use crate::modules::metrics::sys;
+use crate::cf;
+use crate::cpu;
+use crate::snapshot::{Battery, ChipInfo, ThermalPressure};
+use crate::sys;
 
 /// The chip's name, core tiers, GPU core count and memory size. The name falls
 /// back to "Apple Silicon" and the counts to 0 when macOS doesn't report them.

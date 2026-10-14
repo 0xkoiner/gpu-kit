@@ -1,31 +1,70 @@
-//! Prints two samples one second apart: `cargo run -p top-metrics --example dump`.
+//! Samples every metric over one second and writes them as JSON:
+//! `cargo run -- [path]`, to `metrics.json` by default. Then lists the
+//! metrics that came back empty, which this Mac or this run couldn't read.
 
-fn main() {
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+/// The span the rates (CPU, GPU, power, network, disk, processes) cover.
+const INTERVAL: Duration = Duration::from_secs(1);
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "metrics.json".to_owned());
+
+    // Opens IOReport and the SMC and takes the baselines the rates need.
     let mut sampler = top_metrics::Sampler::new();
-    println!("{:?}", sampler.chip());
-    println!("ioreport: {}", sampler.has_ioreport());
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::thread::sleep(INTERVAL);
     let mut snapshot = sampler.sample();
-    snapshot.processes.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
-    let processes = std::mem::take(&mut snapshot.processes);
-    println!("{snapshot:#?}");
-    println!("{} processes; top by CPU:", processes.len());
-    for p in processes.iter().take(8) {
-        println!(
-            "{:>6} {:<14} cpu {:>5.1}% gpu {:>5.1}% mem {:>4.1}% res {:>6} MB time {:>9.1}s {}",
-            p.pid,
-            p.user,
-            p.cpu,
-            p.gpu,
-            p.memory,
-            p.resident / 1_048_576,
-            p.cpu_time,
-            p.command
-        );
+    if let Some(processes) = &mut snapshot.processes {
+        processes.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
     }
-    let mut by_gpu: Vec<_> = processes.iter().filter(|p| p.gpu > 0.0).collect();
-    by_gpu.sort_by(|a, b| b.gpu.total_cmp(&a.gpu));
-    for p in by_gpu.iter().take(3) {
-        println!("gpu {:>5.1}% {}", p.gpu, p.command);
+
+    let report = json!({
+        "interval_secs": INTERVAL.as_secs_f64(),
+        "chip": sampler.chip(),
+        "has_ioreport": sampler.has_ioreport(),
+        "cpu_usage": snapshot.cpu.usage(),
+        "power_total": snapshot.power.total(),
+        "snapshot": snapshot,
+    });
+
+    let mut file = BufWriter::new(File::create(&path)?);
+    serde_json::to_writer_pretty(&mut file, &report)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+
+    let mut missing = Vec::new();
+    nulls(&report, "", &mut missing);
+    println!("wrote {path}");
+    if missing.is_empty() {
+        println!("every metric was read");
+    } else {
+        println!("not read: {}", missing.join(", "));
+    }
+    Ok(())
+}
+
+/// Collects the paths of `null` fields, the metrics that couldn't be read.
+/// Lists aren't walked, so one odd process or volume can't flood the summary.
+fn nulls(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Null => out.push(path.to_owned()),
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                let path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                nulls(field, &path, out);
+            }
+        }
+        _ => {}
     }
 }

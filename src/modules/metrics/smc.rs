@@ -1,8 +1,8 @@
 //! System Management Controller keys over the `AppleSMC` user client. The
 //! command numbers and the `SMCKeyData_t` layout follow smcFanControl's `smc.h`.
 
-use crate::modules::metrics::cf;
-use crate::modules::metrics::sys;
+use crate::cf;
+use crate::sys;
 
 const KERNEL_INDEX_SMC: u32 = 2;
 const CMD_READ_BYTES: u8 = 5;

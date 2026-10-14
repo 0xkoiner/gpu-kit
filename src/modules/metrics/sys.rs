@@ -153,7 +153,7 @@ unsafe impl Plain for u64 {}
 /// Reads a fixed-size `sysctl` value:
 ///
 /// ```
-/// use gpu_ui::modules::metrics::sys::sysctl_value;
+/// use top_metrics::sys::sysctl_value;
 /// assert!(sysctl_value::<u32>("hw.ncpu").is_some_and(|cpus| cpus > 0));
 /// ```
 ///
@@ -161,7 +161,7 @@ unsafe impl Plain for u64 {}
 /// invariants is refused:
 ///
 /// ```compile_fail,E0277
-/// use gpu_ui::modules::metrics::sys::sysctl_value;
+/// use top_metrics::sys::sysctl_value;
 /// let _ = sysctl_value::<String>("kern.ostype");
 /// ```
 pub fn sysctl_value<T: Plain>(name: &str) -> Option<T> {

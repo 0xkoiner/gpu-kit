@@ -1,5 +1,5 @@
-use crate::modules::metrics::snapshot::{CoreKind, CoreTier, CoreUsage};
-use crate::modules::metrics::sys;
+use crate::snapshot::{CoreKind, CoreTier, CoreUsage};
+use crate::sys;
 
 /// Per-core tick counters; usage is the busy share of the delta between reads.
 #[derive(Default)]
@@ -136,7 +136,10 @@ mod tests {
     fn first_reading_only_sets_the_baseline() {
         let mut ticks = CpuTicks::default();
         // Since-boot counters are not an interval, so there is nothing to report yet.
-        assert_eq!(ticks.sample_from(vec![[100, 50, 800, 0]]), Vec::<f32>::new());
+        assert_eq!(
+            ticks.sample_from(vec![[100, 50, 800, 0]]),
+            Vec::<f32>::new()
+        );
     }
 
     #[test]
@@ -170,7 +173,7 @@ mod tests {
         let before = refs();
         for _ in 0..50 {
             ticks.sample();
-            crate::modules::metrics::memory::read(1 << 34);
+            crate::memory::read(1 << 34);
         }
         // Tests running in parallel can hold a reference for a moment; a leak
         // would add one per call, a hundred here.

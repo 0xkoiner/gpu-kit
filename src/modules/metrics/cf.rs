@@ -216,7 +216,7 @@ pub fn dict_get<'a>(dict: &'a CFType, key: &str) -> Option<&'a CFType> {
 /// outlive the object:
 ///
 /// ```compile_fail,E0597
-/// use gpu_ui::modules::metrics::cpu::{CFOwned, data_bytes};
+/// use gpu_ui::modules::metrics::cf::{CFOwned, data_bytes};
 /// let bytes = {
 ///     let data = CFOwned::string("released at the end of this block");
 ///     data_bytes(&data)

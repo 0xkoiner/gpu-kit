@@ -14,6 +14,17 @@ pub struct ChipInfo {
 pub enum CoreKind {
     Efficiency,
     Performance,
+    /// The tier above Performance, as on the M5 Pro.
+    Super,
+}
+
+/// One performance level of the chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CoreTier {
+    pub kind: CoreKind,
+    /// Logical CPUs in this level.
+    pub cores: u32,
 }
 
 #[derive(Debug, Clone, Copy)]

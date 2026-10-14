@@ -226,9 +226,12 @@ pub struct Snapshot {
     pub thermal: Option<ThermalPressure>,
     /// `None` when the kernel's page counts can't be read.
     pub memory: Option<Memory>,
-    /// `read` is received, `write` is sent.
-    pub network: Throughput,
-    pub disk: Throughput,
+    /// `read` is received, `write` is sent. `None` on the first sample, which
+    /// only sets the baseline, and when the interface counters can't be read.
+    pub network: Option<Throughput>,
+    /// `None` on the first sample, which only sets the baseline, and when no
+    /// physical disk's counters can be read.
+    pub disk: Option<Throughput>,
     pub volumes: Vec<Volume>,
     pub battery: Option<Battery>,
     pub uptime_secs: u64,

@@ -1,31 +1,40 @@
-use std::collections::HashSet;
+//! Mounted filesystems from /proc/self/mounts, sized with `statvfs`.
 
-use crate::cf;
+use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
 use crate::snapshot::Volume;
-use crate::sys;
+use crate::{files, sys};
 
-/// The startup volume and the volumes Finder shows under `/Volumes`. `None`
-/// when the mount table can't be read.
+const MOUNTS: &str = "/proc/self/mounts";
+const BY_LABEL: &str = "/dev/disk/by-label";
+
+/// The filesystems a user browses: the root and the other mounts of block
+/// devices. `None` when the mount table can't be read.
 pub fn read() -> Option<Vec<Volume>> {
-    let table = sys::MountTable::read()?;
-    let mut seen_sources = HashSet::new();
-    let volumes = table
-        .entries()
-        .iter()
+    let mounts = parse_mounts(&fs::read_to_string(MOUNTS).ok()?);
+    let labels = labels(Path::new(BY_LABEL));
+    let mut seen_devices = HashSet::new();
+    let volumes = mounts
+        .into_iter()
+        .filter(is_listed)
         .filter_map(|mount| {
-            let mount_point = sys::c_array_to_string(&mount.f_mntonname);
-            let browsable = mount.f_flags & sys::MNT_DONTBROWSE == 0;
-            let name = listed_name(&mount_point, browsable, startup_volume_name)?;
-            let total = bytes(mount.f_blocks, mount.f_bsize)?;
-            let available = bytes(mount.f_bavail, mount.f_bsize)?;
-            // A device or share mounted at two points is listed once; checked
+            let (total, available) = sizes(&mount.mount_point)?;
+            // A device at two mount points (a bind mount) is listed once; checked
             // last, so a mount left out above can't hide the one that counts.
-            if total == 0 || !seen_sources.insert(sys::c_array_to_string(&mount.f_mntfromname)) {
+            let device = device_of(&mount);
+            if total == 0 || !seen_devices.insert(device.clone()) {
                 return None;
             }
             Some(Volume {
-                name,
-                mount_point,
+                name: labels
+                    .get(&device)
+                    .cloned()
+                    .unwrap_or_else(|| name_of(&mount.mount_point)),
+                mount_point: mount.mount_point,
                 total,
                 available,
             })
@@ -34,74 +43,241 @@ pub fn read() -> Option<Vec<Volume>> {
     Some(volumes)
 }
 
-/// The name a mount is listed under: `startup()` for `/`, or its folder for a
-/// browsable volume mounted directly under `/Volumes`. `None` for any other
-/// mount, and for those macOS marks `nobrowse` for Finder to hide (Preboot, VM
-/// and the other system volumes). Going by the flag rather than the name means
-/// a user's own disk called "VM" still shows.
-fn listed_name(
-    mount_point: &str,
-    browsable: bool,
-    startup: impl FnOnce() -> String,
-) -> Option<String> {
-    if mount_point == "/" {
-        return Some(startup());
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mount {
+    source: String,
+    mount_point: String,
+}
+
+/// The mounts of /proc/self/mounts, whose lines go `source mount_point type
+/// options dump pass`, with spaces and the like in the first two written as
+/// `\ooo` octal escapes.
+fn parse_mounts(mounts: &str) -> Vec<Mount> {
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(Mount {
+                source: unescape_octal(fields.next()?),
+                mount_point: unescape_octal(fields.next()?),
+            })
+        })
+        .collect()
+}
+
+fn unescape_octal(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escape = bytes.get(at..at + 4).filter(|window| {
+            window[0] == b'\\'
+                && window[1..]
+                    .iter()
+                    .all(|digit| (b'0'..=b'7').contains(digit))
+        });
+        match escape {
+            Some(window) => {
+                let code = window[1..]
+                    .iter()
+                    .fold(0u32, |code, &digit| code * 8 + u32::from(digit - b'0'));
+                out.push(u8::try_from(code).unwrap_or(b'?'));
+                at += 4;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
     }
-    let folder = mount_point.strip_prefix("/Volumes/")?;
-    (browsable && !folder.is_empty() && !folder.contains('/')).then(|| folder.to_owned())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The startup volume's name, or "Macintosh HD", the name macOS gives it, when
-/// that can't be read.
-fn startup_volume_name() -> String {
-    cf::volume_name("/").unwrap_or_else(|| "Macintosh HD".to_owned())
+/// Whether a mount is one a user browses: a filesystem on a block device
+/// (`/dev/...`), the root among them, that isn't a loop device (every snap on
+/// Ubuntu mounts a squashfs from one) and doesn't sit under /boot, where the
+/// EFI and boot partitions are the firmware's. Pseudo filesystems (proc,
+/// sysfs, cgroup, tmpfs, overlay) have no device. Network mounts are left out
+/// as well: `statvfs` on one whose server has gone away blocks until it comes
+/// back, and Linux has no `MNT_NOWAIT` to ask for cached sizes instead.
+fn is_listed(mount: &Mount) -> bool {
+    mount.source.starts_with("/dev/")
+        && !mount.source.starts_with("/dev/loop")
+        && !Path::new(&mount.mount_point).starts_with("/boot")
 }
 
-/// `blocks` of `block_size` bytes. `None` when that overflows, as only a
-/// misreporting filesystem can make it: a FUSE mount such as sshfs passes on
-/// whatever sizes its server sends.
-fn bytes(blocks: u64, block_size: u32) -> Option<u64> {
-    blocks.checked_mul(u64::from(block_size))
+/// Total and available bytes of the filesystem at `mount_point`. `None` when
+/// `statvfs` fails (a mount that just went away) or the sizes overflow, as
+/// only a misreporting filesystem makes them.
+fn sizes(mount_point: &str) -> Option<(u64, u64)> {
+    let path = CString::new(mount_point).ok()?;
+    let mut stat = sys::statvfs::default();
+    // `path` is NUL-terminated and `stat` is the struct the call fills.
+    if unsafe { sys::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let fragment = stat.f_frsize;
+    Some((
+        stat.f_blocks.checked_mul(fragment)?,
+        stat.f_bavail.checked_mul(fragment)?,
+    ))
+}
+
+/// The block device a mount is on: its source resolved through any symlink
+/// (`/dev/disk/by-uuid/...`), or where the source is a name the kernel made
+/// up, as the `/dev/root` Ubuntu's cloud images mount the root as, the node
+/// under /dev/block that the mount point's device number names. Failing both,
+/// the source as written.
+fn device_of(mount: &Mount) -> PathBuf {
+    fs::canonicalize(&mount.source)
+        .ok()
+        .or_else(|| {
+            let dev = fs::metadata(&mount.mount_point).ok()?.dev();
+            fs::canonicalize(format!("/dev/block/{}:{}", major(dev), minor(dev))).ok()
+        })
+        .unwrap_or_else(|| PathBuf::from(&mount.source))
+}
+
+/// glibc's `gnu_dev_major` and `gnu_dev_minor`: how a `dev_t` packs the two,
+/// each number's low bits in the low word and its high bits above bit 32,
+/// which the casts to 32 bits keep apart.
+fn major(dev: u64) -> u64 {
+    ((dev >> 8) & 0xfff) | u64::from((dev >> 32) as u32 & !0xfff)
+}
+
+fn minor(dev: u64) -> u64 {
+    (dev & 0xff) | u64::from((dev >> 12) as u32 & !0xff)
+}
+
+/// Filesystem labels by the device they're on, from udev's links under
+/// /dev/disk/by-label, whose names write awkward bytes as `\xHH`.
+fn labels(by_label: &Path) -> HashMap<PathBuf, String> {
+    files::entries(by_label)
+        .into_iter()
+        .filter_map(|link| {
+            let device = fs::canonicalize(&link).ok()?;
+            Some((device, unescape_udev(files::name(&link)?)))
+        })
+        .collect()
+}
+
+fn unescape_udev(name: &str) -> String {
+    let mut out = Vec::with_capacity(name.len());
+    let mut rest = name.as_bytes();
+    while let Some(&byte) = rest.first() {
+        let escaped = (byte == b'\\' && rest.len() >= 4 && rest[1] == b'x')
+            .then(|| std::str::from_utf8(&rest[2..4]).ok())
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                rest = &rest[4..];
+            }
+            None => {
+                out.push(byte);
+                rest = &rest[1..];
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A mount's name when its filesystem has no label: the folder it's mounted
+/// at, or "/" for the root.
+fn name_of(mount_point: &str) -> String {
+    mount_point
+        .rsplit('/')
+        .next()
+        .filter(|folder| !folder.is_empty())
+        .unwrap_or(mount_point)
+        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn named(mount_point: &str, browsable: bool) -> Option<String> {
-        listed_name(mount_point, browsable, || "Startup".to_owned())
+    const MOUNT_TABLE: &str = "proc /proc proc rw,relatime 0 0
+/dev/vda / ext4 rw,relatime,discard 0 0
+/dev/vda / ext4 rw,relatime,discard 0 0
+/dev/nvme0n1p15 /boot/efi vfat rw 0 0
+/dev/loop3 /snap/core22/1612 squashfs ro,nodev 0 0
+/dev/sdb1 /media/me/My\\040Disk exfat rw 0 0
+server:/export /mnt/nfs nfs4 rw 0 0
+";
+
+    #[test]
+    fn mounts_parse_with_their_escapes_decoded() {
+        let mounts = parse_mounts(MOUNT_TABLE);
+        assert_eq!(mounts.len(), 7);
+        assert_eq!(mounts[5].source, "/dev/sdb1");
+        assert_eq!(mounts[5].mount_point, "/media/me/My Disk");
+        assert_eq!(unescape_octal("a\\011b\\"), "a\tb\\");
+        assert_eq!(unescape_octal("\\0409"), " 9");
     }
 
     #[test]
-    fn lists_the_startup_volume() {
-        let volumes = read().expect("mount table");
-        assert!(volumes.iter().any(|v| v.mount_point == "/" && v.total > 0));
+    fn only_block_device_mounts_outside_boot_are_listed() {
+        let listed: Vec<String> = parse_mounts(MOUNT_TABLE)
+            .into_iter()
+            .filter(is_listed)
+            .map(|mount| mount.mount_point)
+            .collect();
+        assert_eq!(listed, ["/", "/", "/media/me/My Disk"]);
     }
 
     #[test]
-    fn the_startup_volume_goes_by_its_own_name() {
-        assert_eq!(named("/", true).as_deref(), Some("Startup"));
+    fn udev_label_names_are_decoded() {
+        assert_eq!(unescape_udev("My\\x20Disk"), "My Disk");
+        assert_eq!(unescape_udev("plain"), "plain");
+        assert_eq!(unescape_udev("odd\\x2"), "odd\\x2");
     }
 
     #[test]
-    fn browsable_volumes_go_by_their_folder() {
-        assert_eq!(named("/Volumes/Backup", true).as_deref(), Some("Backup"));
-        // Named like a system volume, but only the `nobrowse` flag hides one.
-        assert_eq!(named("/Volumes/VM", true).as_deref(), Some("VM"));
+    fn unlabelled_volumes_go_by_their_folder() {
+        assert_eq!(name_of("/"), "/");
+        assert_eq!(name_of("/media/me/My Disk"), "My Disk");
     }
 
     #[test]
-    fn hidden_nested_and_other_mounts_are_left_out() {
-        assert_eq!(named("/Volumes/Recovery", false), None);
-        assert_eq!(named("/Volumes/.timemachine/snapshot", true), None);
-        assert_eq!(named("/Volumes/", true), None);
-        assert_eq!(named("/System/Volumes/Data", true), None);
-        assert_eq!(named("/dev", true), None);
+    fn device_numbers_unpack_as_glibc_packs_them() {
+        // nvme0n1p1 is 259:1; a minor past 255 spills into the high bits.
+        assert_eq!((major(66305), minor(66305)), (259, 1));
+        assert_eq!(
+            (major(0x0000_1000_0000_0300), minor(0x0000_1000_0000_0300)),
+            (4099, 0)
+        );
+        assert_eq!(
+            (major(0x0000_0000_0010_0000), minor(0x0000_0000_0010_0000)),
+            (0, 256)
+        );
     }
 
     #[test]
-    fn sizes_too_large_to_count_in_bytes_are_rejected() {
-        assert_eq!(bytes(1_000, 4096), Some(4_096_000));
-        assert_eq!(bytes(u64::MAX / 2, 4096), None);
+    fn a_made_up_source_resolves_through_the_mount_point() {
+        let root = Mount {
+            source: "/dev/root".to_owned(),
+            mount_point: "/".to_owned(),
+        };
+        let device = device_of(&root);
+        // Without udev's /dev/block links (a container) the source stays as written.
+        assert!(
+            device == Path::new("/dev/root") || device.starts_with("/dev/"),
+            "{device:?}"
+        );
+        if Path::new("/dev/block").exists() {
+            assert_ne!(device, Path::new("/dev/root"));
+        }
+    }
+
+    #[test]
+    fn the_root_filesystem_has_a_size() {
+        let (total, available) = sizes("/").expect("statvfs on /");
+        assert!(total > 0 && available <= total, "{total} {available}");
+        let volumes = read().expect("/proc/self/mounts");
+        if Path::new("/dev/vda").exists() || Path::new("/dev/sda").exists() {
+            assert!(volumes.iter().any(|v| v.mount_point == "/"), "{volumes:?}");
+        }
     }
 }

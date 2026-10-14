@@ -1,6 +1,6 @@
 //! Samples every metric over one second and writes them as JSON:
 //! `cargo run -- [path]`, to `metrics.json` by default. Then lists the
-//! metrics that came back empty, which this Mac or this run couldn't read.
+//! metrics that came back empty, which this machine or this run couldn't read.
 
 use std::error::Error;
 use std::fs::File;
@@ -17,7 +17,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .unwrap_or_else(|| "metrics.json".to_owned());
 
-    // Opens IOReport and the SMC and takes the baselines the rates need.
+    // Loads the GPU driver's library, opens RAPL and takes the baselines the
+    // rates need.
     let mut sampler = top_metrics::Sampler::new();
     std::thread::sleep(INTERVAL);
     let mut snapshot = sampler.sample();
@@ -28,7 +29,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let report = json!({
         "interval_secs": INTERVAL.as_secs_f64(),
         "chip": sampler.chip(),
-        "has_ioreport": sampler.has_ioreport(),
         "cpu_usage": snapshot.cpu.usage(),
         "power_total": snapshot.power.total(),
         "snapshot": snapshot,

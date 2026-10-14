@@ -1,87 +1,153 @@
+//! Block device byte counters from /proc/diskstats; rates come from deltas.
+
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
 
-use crate::cf;
+use crate::files;
 use crate::rate::{ByteCounts, ByteRates};
 use crate::snapshot::Throughput;
 
-/// Read/write byte counters of each physical block storage driver; rates come from deltas.
+const BLOCK: &str = "/sys/block";
+
+/// /proc/diskstats counts 512-byte sectors whatever the device's own sector size.
+const SECTOR: u64 = 512;
+
+/// Read/write byte counters of each physical disk; rates come from deltas.
 #[derive(Default)]
 pub struct DiskCounters {
-    rates: ByteRates<u64>,
-    /// Whether each driver of the last read sits on a virtual interface, by
-    /// registry ID. An entry's ancestry is fixed, so this saves searching it
-    /// again on every read.
-    virtual_drivers: HashMap<u64, bool>,
+    rates: ByteRates<String>,
 }
 
 impl DiskCounters {
     /// `None` on the first call, which only sets the baseline, and when no
-    /// physical driver's counters can be read.
+    /// physical disk's counters can be read.
     pub fn sample(&mut self) -> Option<Throughput> {
-        self.rates
-            .sample(Instant::now(), read_drivers(&mut self.virtual_drivers))
+        self.rates.sample(Instant::now(), read_disks())
     }
 }
 
-/// Counters of each physical driver by registry ID, which survives disks
-/// coming and going. `None` when the registry can't be searched, or when no
-/// physical driver's counters can be read: every Mac boots from one.
-///
-/// `virtual_drivers` is the previous read's answers; it's replaced with this
-/// read's, so drivers that went away drop out of it.
-fn read_drivers(virtual_drivers: &mut HashMap<u64, bool>) -> Option<HashMap<u64, ByteCounts>> {
-    let mut drivers = HashMap::new();
-    let mut seen = HashMap::new();
-    let searched = cf::for_each_service("IOBlockStorageDriver", |driver| {
-        let Some(id) = cf::registry_id(driver) else {
-            return;
-        };
-        let on_virtual = virtual_drivers
-            .get(&id)
-            .copied()
-            .or_else(|| is_virtual(driver));
-        if let Some(on_virtual) = on_virtual {
-            seen.insert(id, on_virtual);
-        }
-        if on_virtual != Some(true)
-            && let Some(counts) = read_counts(driver)
-        {
-            drivers.insert(id, counts);
-        }
-    });
-    if searched {
-        *virtual_drivers = seen;
-    }
-    (searched && !drivers.is_empty()).then_some(drivers)
+/// Counters of each physical disk by name. `None` when /proc/diskstats can't
+/// be read or lists no physical disk: every machine boots from one, though a
+/// container may be shown none.
+fn read_disks() -> Option<HashMap<String, ByteCounts>> {
+    let disks: HashMap<String, ByteCounts> = parse_counts(&files::read("/proc/diskstats")?)
+        .into_iter()
+        .filter(|(name, _)| is_physical_disk(Path::new(BLOCK), name))
+        .collect();
+    (!disks.is_empty()).then_some(disks)
 }
 
-/// A driver whose statistics can't be read is left out of this read rather
-/// than counted as zero, so it can't later jump by its since-attach total.
-fn read_counts(driver: cf::io_object_t) -> Option<ByteCounts> {
-    let stats = cf::property(driver, "Statistics")?;
-    // The kernel's counters are unsigned; CF hands them over as i64, and `as` restores the bits.
-    let stat = |key| {
-        cf::dict_get(&stats, key)
-            .and_then(cf::number_i64)
-            .map(|n| n as u64)
+/// `(name, bytes)` of every device in /proc/diskstats, whose fields are
+/// major, minor, name, then reads completed, reads merged, sectors read, ms
+/// reading, writes completed, writes merged, sectors written, and more.
+fn parse_counts(diskstats: &str) -> Vec<(String, ByteCounts)> {
+    diskstats
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let bytes = |ix: usize| fields.get(ix)?.parse::<u64>().ok()?.checked_mul(SECTOR);
+            let counts = ByteCounts {
+                read: bytes(5)?,
+                written: bytes(9)?,
+            };
+            Some((fields.get(2)?.to_string(), counts))
+        })
+        .collect()
+}
+
+/// Whether `name` is a whole physical disk: it has its own entry under
+/// /sys/block (a partition's sits under its disk's) that isn't a virtual
+/// device. Loop devices (every snap on Ubuntu mounts one), device-mapper
+/// (LVM, LUKS), md RAID and zram are virtual: their I/O lands on the disks
+/// beneath them, so counting both would double it, and a RAM disk's I/O is no
+/// disk traffic. An NVMe multipath system also lists each path (`nvme0c0n1`)
+/// beside the disk it reaches (`nvme0n1`); the paths are skipped.
+fn is_physical_disk(block: &Path, name: &str) -> bool {
+    if name.contains('/') || is_nvme_path(name) {
+        return false;
+    }
+    let Some(virtual_devices) = block.parent().map(|sys| sys.join("devices/virtual")) else {
+        return false;
     };
-    Some(ByteCounts {
-        read: stat("Bytes (Read)")?,
-        written: stat("Bytes (Write)")?,
-    })
+    std::fs::canonicalize(block.join(name)).is_ok_and(|device| !device.starts_with(virtual_devices))
 }
 
-/// Disk images and RAM disks sit on a virtual interface. A disk image's I/O
-/// also lands on the disk holding its file, so counting both would double it;
-/// a RAM disk's never reaches a disk, so it isn't disk traffic at all.
-/// `None` when no ancestor states its interconnect: the driver is counted, and
-/// asked again on the next read rather than remembered.
-fn is_virtual(driver: cf::io_object_t) -> Option<bool> {
-    let protocol = cf::inherited_property(driver, "Protocol Characteristics")?;
-    Some(
-        cf::dict_get(&protocol, "Physical Interconnect")
-            .and_then(cf::string)
-            .is_some_and(|interconnect| interconnect == "Virtual Interface"),
-    )
+/// `nvme<ctrl>c<path>n<ns>` names one path to a namespace, not the namespace.
+fn is_nvme_path(name: &str) -> bool {
+    name.strip_prefix("nvme")
+        .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_digit()))
+        .is_some_and(|rest| rest.starts_with('c'))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    const DISKSTATS: &str = "   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+ 254       0 vda 21524 4420 2625050 7615 2348 1582 675904 2185 0 6892 10233 658 0 8600 416 29 15
+ 254       1 vda1 21000 4420 2600000 7600 2300 1582 675000 2185 0 6892 10233 0 0 0 0 0 0
+";
+
+    #[test]
+    fn sectors_become_bytes_per_device() {
+        let counts = parse_counts(DISKSTATS);
+        assert_eq!(counts.len(), 3);
+        assert_eq!(counts[1].0, "vda");
+        assert_eq!(
+            (counts[1].1.read, counts[1].1.written),
+            (2_625_050 * 512, 675_904 * 512)
+        );
+    }
+
+    /// A fake /sys with a physical disk and a loop device, as symlinks into
+    /// `devices`, the way sysfs lays /sys/block out.
+    fn fake_sys() -> PathBuf {
+        let sys = std::env::temp_dir().join(format!("top-metrics-disk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sys);
+        for dir in [
+            "block",
+            "devices/virtual/block/loop0",
+            "devices/pci0000:00/virtio1/block/vda",
+        ] {
+            fs::create_dir_all(sys.join(dir)).expect("fixture dir");
+        }
+        std::os::unix::fs::symlink("../devices/virtual/block/loop0", sys.join("block/loop0"))
+            .expect("loop0 link");
+        std::os::unix::fs::symlink(
+            "../devices/pci0000:00/virtio1/block/vda",
+            sys.join("block/vda"),
+        )
+        .expect("vda link");
+        sys
+    }
+
+    #[test]
+    fn partitions_and_virtual_devices_are_not_disks() {
+        let sys = fake_sys();
+        let block = sys.join("block");
+        assert!(is_physical_disk(&block, "vda"));
+        assert!(!is_physical_disk(&block, "vda1"), "no entry of its own");
+        assert!(!is_physical_disk(&block, "loop0"), "virtual");
+        assert!(!is_physical_disk(&block, "../devices"), "not a name");
+        let _ = fs::remove_dir_all(sys);
+    }
+
+    #[test]
+    fn nvme_paths_are_told_from_namespaces() {
+        assert!(is_nvme_path("nvme0c0n1"));
+        assert!(!is_nvme_path("nvme0n1"));
+        assert!(!is_nvme_path("nvme10n2"));
+        assert!(!is_nvme_path("sda"));
+    }
+
+    #[test]
+    fn this_machine_boots_from_a_physical_disk() {
+        if Path::new(BLOCK).exists() {
+            assert!(read_disks().is_some_and(|disks| !disks.is_empty()));
+        }
+    }
 }

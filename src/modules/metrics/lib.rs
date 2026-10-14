@@ -1,41 +1,31 @@
-//! Apple Silicon system metrics, sampled the way mactop does, through raw
-//! FFI to IOKit, CoreFoundation, libIOReport and libSystem. No crate
-//! dependencies (the `serde` feature adds `Serialize` to the snapshot types)
-//! and no root: IOReport, the SMC, libproc and sysctl are all readable by an
-//! ordinary user outside an app sandbox.
-#![cfg(target_os = "macos")]
+//! Linux system metrics for the UI, read from /proc and /sys, with NVML (the
+//! NVIDIA driver's library) or the amdgpu driver's sysfs files for the GPU.
+//! No crate dependencies (the `serde` feature adds `Serialize` to the snapshot
+//! types) and no root, apart from RAPL's energy counters, which recent kernels
+//! open to root alone. A metric the machine doesn't provide is `None`.
+#![cfg(target_os = "linux")]
 
-// Public only so their doctests, which prove the safe wrappers can't be
-// misused, can reach them; not part of the API.
-#[doc(hidden)]
-pub mod cf;
+mod amdgpu;
 mod cpu;
 mod disk;
-mod ioreport;
+mod files;
+mod gpu;
 mod memory;
 mod network;
+mod nvml;
+mod power;
 mod process;
 mod rate;
-mod smc;
 mod snapshot;
-#[doc(hidden)]
-pub mod sys;
+mod sys;
 mod system;
+mod thermal;
 mod volumes;
 
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 pub use process::{Signal, SignalError, is_running, send_signal};
 pub use snapshot::*;
-
-/// mactop's ANE scale: the engine's power draw at full load, in watts. A
-/// guess inherited from asitop; nothing measures the real figure.
-pub const ANE_FULL_LOAD_WATTS: f32 = 8.0;
-
-/// Die temperatures change slowly, while reading every sensor costs one SMC
-/// call each (about 8 ms for the 41 sensors of an M1 Max); reuse a reading
-/// for this long.
-const TEMPERATURE_MAX_AGE: Duration = Duration::from_secs(5);
 
 /// Owns every counter whose rate needs a previous reading. Rates cover the
 /// time between two `sample` calls, so the first call has none (`None`);
@@ -43,11 +33,8 @@ const TEMPERATURE_MAX_AGE: Duration = Duration::from_secs(5);
 pub struct Sampler {
     chip: ChipInfo,
     cpu: cpu::CpuTicks,
-    ioreport: Option<ioreport::IOReport>,
-    smc: Option<smc::Smc>,
-    temperatures: Option<(Instant, Temperatures)>,
-    /// Whether the per-block energy counters read zero; see `energy_counters_dead`.
-    energy_dead: bool,
+    gpus: Option<gpu::Gpus>,
+    rapl: Option<power::Rapl>,
     processes: process::ProcessTable,
     lists_processes: bool,
     network: network::NetworkCounters,
@@ -55,16 +42,16 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Opens IOReport and the SMC. Indexing SMC keys takes a few hundred
-    /// milliseconds, so construct this off the UI thread.
+    /// Loads the GPU driver's library, if there is one, and opens RAPL. Both
+    /// take a moment, so construct this off the UI thread.
     pub fn new() -> Self {
+        let gpus = gpu::Gpus::open();
+        let gpu_cores = gpus.as_ref().and_then(gpu::Gpus::cores).unwrap_or(0);
         let mut sampler = Self {
-            chip: system::chip_info(),
+            chip: system::chip_info(gpu_cores),
             cpu: cpu::CpuTicks::default(),
-            ioreport: ioreport::IOReport::new(),
-            smc: smc::Smc::open(),
-            temperatures: None,
-            energy_dead: false,
+            gpus,
+            rapl: power::Rapl::open(),
             processes: process::ProcessTable::new(),
             lists_processes: true,
             network: network::NetworkCounters::default(),
@@ -85,106 +72,60 @@ impl Sampler {
     }
 
     /// Starts or stops listing processes. Starting records a baseline for
-    /// their CPU and GPU rates, so wait a moment before the next `sample`.
+    /// their CPU rates, so wait a moment before the next `sample`.
     pub fn set_lists_processes(&mut self, lists: bool) {
         if lists && !self.lists_processes {
-            self.processes.sample(self.chip.memory_bytes);
+            self.processes
+                .sample(self.chip.memory_bytes, &HashMap::new());
         }
         self.lists_processes = lists;
-    }
-
-    /// Whether power, frequency and GPU readings are available.
-    pub fn has_ioreport(&self) -> bool {
-        self.ioreport.is_some()
     }
 
     pub fn sample(&mut self) -> Snapshot {
         let core_usage = self.cpu.sample();
         let cores = cpu::label_cores(&core_usage, &self.chip.tiers);
-
-        let reading = self.ioreport.as_mut().and_then(|io| io.sample());
-        if let Some(reading) = &reading {
-            self.energy_dead = energy_counters_dead(&reading.energy, self.energy_dead);
-        }
-        let energy = reading.as_ref().map(|reading| reading.energy);
-        let live = energy.filter(|_| !self.energy_dead);
+        let gpu = self.gpus.as_mut().and_then(gpu::Gpus::sample);
+        let energy = self
+            .rapl
+            .as_mut()
+            .and_then(power::Rapl::sample)
+            .unwrap_or_default();
         let power = Power {
-            cpu: live.and_then(|e| e.cpu),
-            gpu: energy.and_then(|e| Some(e.gpu? + e.gpu_sram.unwrap_or(0.0))),
-            ane: live.and_then(|e| e.ane),
-            dram: live.and_then(|e| e.dram),
-            system: self.smc.as_ref().and_then(|smc| smc.system_power()),
+            cpu: energy.cpu,
+            gpu: gpu.as_ref().and_then(|gpu| gpu.watts),
+            dram: energy.dram,
+            system: energy.system.or_else(system::battery_power),
         };
-        let temperatures = self.temperatures();
+        let no_shares = HashMap::new();
+        let gpu_shares = gpu.as_ref().map_or(&no_shares, |gpu| &gpu.process_shares);
 
         Snapshot {
             cpu: Cpu {
                 cores,
-                clocks: reading
-                    .as_ref()
-                    .map(|reading| reading.tier_clocks(&self.chip.tiers))
-                    .unwrap_or_default(),
+                clocks: cpu::tier_clocks(&self.chip.tiers),
             },
-            gpu: reading
-                .as_ref()
-                .and_then(|reading| reading.gpu)
-                .map(|gpu| Gpu {
-                    usage: gpu.usage,
-                    mhz: gpu.mhz,
-                }),
-            ane: power
-                .ane
-                .map(|watts| (watts / ANE_FULL_LOAD_WATTS * 100.0).clamp(0.0, 100.0)),
-            ane_traffic: reading.as_ref().and_then(|reading| reading.ane_traffic),
+            gpu: gpu.as_ref().map(|gpu| Gpu {
+                usage: gpu.usage,
+                mhz: gpu.mhz,
+            }),
             power,
-            temperatures,
-            thermal: system::thermal_pressure(),
-            memory: memory::read(self.chip.memory_bytes),
+            temperatures: Temperatures {
+                cpu: thermal::cpu_temperature(),
+                gpu: gpu.as_ref().and_then(|gpu| gpu.celsius),
+            },
+            thermal: thermal::pressure(),
+            memory: memory::read(),
             network: self.network.sample(),
             disk: self.disk.sample(),
             volumes: volumes::read(),
             battery: system::battery(),
             uptime_secs: system::uptime_secs(),
             processes: if self.lists_processes {
-                self.processes.sample(self.chip.memory_bytes)
+                self.processes.sample(self.chip.memory_bytes, gpu_shares)
             } else {
                 None
             },
         }
-    }
-}
-
-impl Sampler {
-    fn temperatures(&mut self) -> Temperatures {
-        if let Some((at, temperatures)) = self.temperatures
-            && at.elapsed() < TEMPERATURE_MAX_AGE
-        {
-            return temperatures;
-        }
-        let (cpu, gpu) = self
-            .smc
-            .as_ref()
-            .map(|smc| smc.temperatures())
-            .unwrap_or_default();
-        let temperatures = Temperatures { cpu, gpu };
-        self.temperatures = Some((Instant::now(), temperatures));
-        temperatures
-    }
-}
-
-/// Whether the per-block energy counters are dead, as macOS 27 betas leave
-/// them: on a working system CPU and DRAM never both read zero, since the
-/// sampler itself runs on a CPU and DRAM refreshes, while GPU energy still
-/// flowing proves the sample arrived. A missing channel proves nothing, and a
-/// sample that settles neither way keeps `previous`.
-fn energy_counters_dead(energy: &ioreport::Energy, previous: bool) -> bool {
-    let reads = |watts: Option<f32>| watts.is_some_and(|watts| watts > 0.0);
-    if reads(energy.cpu) || reads(energy.dram) {
-        false
-    } else if energy.cpu.is_some() && energy.dram.is_some() && reads(energy.gpu) {
-        true
-    } else {
-        previous
     }
 }
 
@@ -196,35 +137,28 @@ impl Default for Sampler {
 
 #[cfg(test)]
 mod tests {
-    use super::energy_counters_dead;
-    use crate::ioreport::Energy;
+    use super::*;
 
     #[test]
-    fn spots_dead_energy_counters() {
-        let energy = |cpu, gpu, dram| Energy {
-            cpu,
-            gpu,
-            dram,
-            ..Energy::default()
-        };
-        let (zero, gpu) = (Some(0.0), Some(7.5));
-        assert!(energy_counters_dead(&energy(zero, gpu, zero), false));
+    fn a_sample_of_this_machine_has_cores_memory_and_processes() {
+        let mut sampler = Sampler::new();
+        let snapshot = sampler.sample();
         assert!(
-            !energy_counters_dead(&energy(Some(0.4), gpu, Some(0.3)), true),
-            "counters came back"
+            !snapshot.cpu.cores.is_empty(),
+            "the baseline was taken in new()"
+        );
+        assert!(snapshot.memory.is_some_and(|memory| memory.total > 0));
+        assert!(snapshot.uptime_secs > 0);
+        assert!(
+            snapshot
+                .processes
+                .is_some_and(|processes| !processes.is_empty())
         );
         assert!(
-            !energy_counters_dead(&energy(zero, zero, Some(0.3)), true),
-            "DRAM alone proves them alive"
+            snapshot.network.is_some(),
+            "the baseline was taken in new()"
         );
-        assert!(
-            energy_counters_dead(&energy(zero, zero, zero), true),
-            "an empty sample keeps the verdict"
-        );
-        assert!(!energy_counters_dead(&energy(zero, zero, zero), false));
-        assert!(
-            !energy_counters_dead(&energy(None, gpu, None), false),
-            "channels this chip lacks are not dead ones"
-        );
+        sampler.set_lists_processes(false);
+        assert!(sampler.sample().processes.is_none());
     }
 }

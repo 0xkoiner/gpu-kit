@@ -1,134 +1,299 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+//! The machine: its chip, uptime and battery, from /proc and /sys.
 
-use crate::cf;
-use crate::cpu;
-use crate::snapshot::{Battery, ChipInfo, ThermalPressure};
-use crate::sys;
+use std::path::{Path, PathBuf};
 
-/// The chip's name, core tiers, GPU core count and memory size. The name falls
-/// back to "Apple Silicon" and the counts to 0 when macOS doesn't report them.
-pub fn chip_info() -> ChipInfo {
+use crate::snapshot::{Battery, ChipInfo};
+use crate::{cpu, files, memory};
+
+const POWER_SUPPLY: &str = "/sys/class/power_supply";
+
+/// The chip's name, core tiers and memory, with the GPU core count the GPU
+/// driver gave. The name falls back to "Unknown CPU" and memory to 0 when
+/// /proc doesn't say.
+pub fn chip_info(gpu_cores: u32) -> ChipInfo {
     ChipInfo {
-        name: sys::sysctl_string("machdep.cpu.brand_string")
-            .unwrap_or_else(|| "Apple Silicon".into()),
+        name: chip_name(),
         tiers: cpu::core_tiers(),
-        gpu_cores: gpu_core_count().unwrap_or(0),
-        memory_bytes: sys::sysctl_value::<u64>("hw.memsize").unwrap_or(0),
+        gpu_cores,
+        memory_bytes: memory::total_bytes().unwrap_or(0),
     }
 }
 
-/// From the first `AGXAccelerator` registry entry that states a count, as
-/// `ioreg -rc AGXAccelerator` lists them.
-fn gpu_core_count() -> Option<u32> {
-    let mut cores = None;
-    cf::for_each_service("AGXAccelerator", |accelerator| {
-        if cores.is_none() {
-            cores = int_property(accelerator, "gpu-core-count")
-                .and_then(|count| u32::try_from(count).ok());
-        }
-    });
-    cores
+fn chip_name() -> String {
+    files::read("/proc/cpuinfo")
+        .and_then(|cpuinfo| parse_chip_name(&cpuinfo, device_tree_model))
+        .unwrap_or_else(|| "Unknown CPU".to_owned())
 }
 
-/// Seconds since boot, sleep included, as `uptime` counts them. 0 when the
-/// boot time can't be read.
+/// A board's name from its device tree, as Raspberry Pis have; the file ends
+/// in a NUL.
+fn device_tree_model() -> Option<String> {
+    files::read("/proc/device-tree/model")
+        .map(|model| model.trim_end_matches('\0').to_owned())
+        .filter(|model| !model.is_empty())
+}
+
+/// x86's `model name`, with its runs of spaces squeezed. ARM's cpuinfo names
+/// no chip, only the implementer and part numbers, so a board's device tree
+/// model comes next, then the core those numbers name: AWS's Graviton 2, 3 and
+/// 4 are Neoverse N1, V1 and V2 cores.
+fn parse_chip_name(
+    cpuinfo: &str,
+    device_tree_model: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(name) = files::field(cpuinfo, "model name") {
+        return Some(name.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    if let Some(model) = device_tree_model() {
+        return Some(model);
+    }
+    let implementer = files::field(cpuinfo, "CPU implementer")?;
+    let part = files::field(cpuinfo, "CPU part")?;
+    Some(
+        arm_core(implementer, part)
+            .map_or_else(|| format!("ARM {implementer} part {part}"), str::to_owned),
+    )
+}
+
+/// Arm Ltd's (implementer 0x41) part numbers, from the kernel's <asm/cputype.h>.
+fn arm_core(implementer: &str, part: &str) -> Option<&'static str> {
+    if implementer != "0x41" {
+        return None;
+    }
+    Some(
+        match u32::from_str_radix(part.trim_start_matches("0x"), 16).ok()? {
+            0xd03 => "Cortex-A53",
+            0xd07 => "Cortex-A57",
+            0xd08 => "Cortex-A72",
+            0xd09 => "Cortex-A73",
+            0xd0a => "Cortex-A75",
+            0xd0b => "Cortex-A76",
+            0xd0d => "Cortex-A77",
+            0xd41 => "Cortex-A78",
+            0xd0c => "Neoverse-N1",
+            0xd49 => "Neoverse-N2",
+            0xd40 => "Neoverse-V1",
+            0xd4f => "Neoverse-V2",
+            _ => return None,
+        },
+    )
+}
+
+/// Seconds since boot, sleep included, as /proc/uptime counts them. 0 when it
+/// can't be read.
 pub fn uptime_secs() -> u64 {
-    let boot = sys::sysctl_value::<sys::timeval>("kern.boottime").map(|t| t.tv_sec);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    uptime_since(boot, now)
+    files::read("/proc/uptime")
+        .and_then(|uptime| uptime.split_whitespace().next()?.parse::<f64>().ok())
+        .map_or(0, |secs| secs as u64)
 }
 
-/// Zero when the boot time is unknown, rather than the time since 1970.
-fn uptime_since(boot: Option<i64>, now: u64) -> u64 {
-    boot.filter(|&secs| secs > 0)
-        .map_or(0, |secs| now.saturating_sub(secs as u64))
-}
-
-/// The kernel's thermal pressure level, read through libnotify. `None` when
-/// the notify state can't be read or is a level macOS doesn't define.
-pub fn thermal_pressure() -> Option<ThermalPressure> {
-    let name = c"com.apple.system.thermalpressurelevel";
-    let mut token = 0;
-    let mut level = 0u64;
-    // The out-pointers are locals of the types <notify.h> declares, and a
-    // registered token is cancelled whether or not its state could be read.
-    let status = unsafe {
-        if sys::notify_register_check(name.as_ptr(), &mut token) != 0 {
-            return None;
-        }
-        let status = sys::notify_get_state(token, &mut level);
-        sys::notify_cancel(token);
-        status
-    };
-    if status != 0 {
-        return None;
-    }
-    ThermalPressure::try_from(level).ok()
-}
-
-/// Charge and power source of the internal battery, from its
-/// `AppleSmartBattery` registry entry. `None` on a Mac without one, or when
-/// its capacity can't be read.
+/// Charge of the machine's own batteries and whether it runs on mains power.
+/// `None` without a battery. A wireless mouse's battery has `scope` Device
+/// and isn't the machine's.
 pub fn battery() -> Option<Battery> {
-    let mut battery = None;
-    cf::for_each_service("AppleSmartBattery", |entry| {
-        let capacity = (
-            int_property(entry, "CurrentCapacity"),
-            int_property(entry, "MaxCapacity"),
-        );
-        if let (Some(current), Some(max)) = capacity
-            && let Some(percent) = percent(current, max)
-        {
-            battery = Some(Battery {
-                percent,
-                on_ac: cf::property(entry, "ExternalConnected")
-                    .is_some_and(|value| cf::is_true(&value)),
-            });
-        }
-    });
-    battery
+    battery_in(Path::new(POWER_SUPPLY))
 }
 
-/// `current` as a share of `max`, clamped to 0–100. `None` when `max` isn't
-/// positive or the capacities are too large to scale.
-fn percent(current: i64, max: i64) -> Option<u32> {
-    if max <= 0 {
+fn battery_in(power_supply: &Path) -> Option<Battery> {
+    let supplies = files::entries(power_supply);
+    let batteries: Vec<&PathBuf> = supplies
+        .iter()
+        .filter(|supply| is_system_battery(supply))
+        .collect();
+    let charges: Vec<u32> = batteries
+        .iter()
+        .filter_map(|battery| charge(battery))
+        .collect();
+    if charges.is_empty() {
         return None;
     }
-    // Clamped to 0–100, so the cast can't wrap.
-    Some((current.checked_mul(100)? / max).clamp(0, 100) as u32)
+    let percent = charges.iter().sum::<u32>() / charges.len() as u32;
+    // Mains power is a supply of type Mains, or USB for a USB-C charger, that
+    // is online. A machine that lists none says through its battery's status.
+    let mains: Vec<&PathBuf> = supplies
+        .iter()
+        .filter(|supply| {
+            matches!(
+                files::read(supply.join("type")).as_deref(),
+                Some("Mains" | "USB")
+            )
+        })
+        .collect();
+    let on_ac = if mains.is_empty() {
+        batteries.iter().any(|battery| {
+            files::read(battery.join("status")).is_some_and(|status| status != "Discharging")
+        })
+    } else {
+        mains
+            .iter()
+            .any(|supply| files::read_number::<u8>(supply.join("online")) == Some(1))
+    };
+    Some(Battery { percent, on_ac })
 }
 
-/// An integer property of a registry entry.
-fn int_property(entry: cf::io_object_t, key: &str) -> Option<i64> {
-    let value = cf::property(entry, key)?;
-    cf::number_i64(&value)
+fn is_system_battery(supply: &Path) -> bool {
+    files::read(supply.join("type")).as_deref() == Some("Battery")
+        && files::read(supply.join("scope")).is_none_or(|scope| scope != "Device")
+}
+
+/// A battery's charge, 0–100: its `capacity`, or the share of full it holds,
+/// in energy or in charge.
+fn charge(battery: &Path) -> Option<u32> {
+    if let Some(capacity) = files::read_number::<u32>(battery.join("capacity")) {
+        return Some(capacity.min(100));
+    }
+    [("energy_now", "energy_full"), ("charge_now", "charge_full")]
+        .into_iter()
+        .find_map(|(now, full)| {
+            let now: u64 = files::read_number(battery.join(now))?;
+            let full: u64 = files::read_number(battery.join(full))?;
+            (full > 0).then(|| (now.saturating_mul(100) / full).min(100) as u32)
+        })
+}
+
+/// Whole-system draw while on battery, as the discharging batteries report
+/// it: `power_now`, or current times voltage. On mains Linux has nothing to
+/// meter the machine with, so `None` then, as without a battery.
+pub fn battery_power() -> Option<f32> {
+    battery_power_in(Path::new(POWER_SUPPLY))
+}
+
+fn battery_power_in(power_supply: &Path) -> Option<f32> {
+    let watts: f64 = files::entries(power_supply)
+        .iter()
+        .filter(|supply| {
+            is_system_battery(supply)
+                && files::read(supply.join("status")).as_deref() == Some("Discharging")
+        })
+        .filter_map(|battery| {
+            // Microwatts, or microamps times microvolts.
+            if let Some(microwatts) = files::read_number::<u64>(battery.join("power_now")) {
+                return Some(microwatts as f64 / 1e6);
+            }
+            let microamps = files::read_number::<i64>(battery.join("current_now"))?;
+            let microvolts: u64 = files::read_number(battery.join("voltage_now"))?;
+            Some(microamps.unsigned_abs() as f64 * microvolts as f64 / 1e12)
+        })
+        .sum();
+    (watts > 0.0 && watts.is_finite()).then_some(watts as f32)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
-    fn unknown_boot_time_is_not_counted_from_1970() {
-        assert_eq!(uptime_since(None, 1_760_000_000), 0);
-        assert_eq!(uptime_since(Some(1_760_000_000 - 90), 1_760_000_000), 90);
+    fn x86_chips_go_by_their_model_name() {
+        let cpuinfo =
+            "processor\t: 0\nmodel name\t: Intel(R) Xeon(R)  Platinum 8259CL CPU @ 2.50GHz\n";
+        assert_eq!(
+            parse_chip_name(cpuinfo, || Some("ignored".into())).as_deref(),
+            Some("Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz")
+        );
     }
 
     #[test]
-    fn battery_percent_is_clamped_and_never_divides_by_zero() {
-        assert_eq!(percent(42, 100), Some(42));
-        assert_eq!(percent(3_000, 6_000), Some(50));
-        assert_eq!(percent(120, 100), Some(100));
-        assert_eq!(percent(-5, 100), Some(0));
-        assert_eq!(percent(50, 0), None);
+    fn arm_chips_go_by_their_board_then_their_core() {
+        let graviton2 =
+            "processor\t: 0\nBogoMIPS\t: 243.75\nCPU implementer\t: 0x41\nCPU part\t: 0xd0c\n";
+        assert_eq!(
+            parse_chip_name(graviton2, || None).as_deref(),
+            Some("Neoverse-N1")
+        );
+        assert_eq!(
+            parse_chip_name(graviton2, || Some("Raspberry Pi 4 Model B".into())).as_deref(),
+            Some("Raspberry Pi 4 Model B")
+        );
+        let apple = "CPU implementer\t: 0x61\nCPU part\t: 0x023\n";
+        assert_eq!(
+            parse_chip_name(apple, || None).as_deref(),
+            Some("ARM 0x61 part 0x023")
+        );
+        assert!(parse_chip_name("flags\t: fpu\n", || None).is_none());
     }
 
     #[test]
-    fn battery_capacities_too_large_to_scale_are_rejected() {
-        assert_eq!(percent(i64::MAX, i64::MAX), None);
+    fn this_machine_has_a_chip_and_an_uptime() {
+        let chip = chip_info(0);
+        assert_ne!(chip.name, "Unknown CPU");
+        assert!(chip.memory_bytes > 0);
+        assert!(uptime_secs() > 0);
+    }
+
+    /// A fake /sys/class/power_supply with the given supplies, each a
+    /// directory of `(file, contents)`.
+    fn fake_supplies(name: &str, supplies: &[(&str, &[(&str, &str)])]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("top-metrics-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (supply, files) in supplies {
+            let dir = root.join(supply);
+            fs::create_dir_all(&dir).expect("fixture dir");
+            for (file, contents) in *files {
+                fs::write(dir.join(file), format!("{contents}\n")).expect("fixture file");
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn battery_charge_and_mains_power_are_read() {
+        let root = fake_supplies(
+            "battery",
+            &[
+                ("AC", &[("type", "Mains"), ("online", "1")]),
+                (
+                    "BAT0",
+                    &[
+                        ("type", "Battery"),
+                        ("capacity", "73"),
+                        ("status", "Charging"),
+                    ],
+                ),
+                // A wireless mouse's battery is not the machine's.
+                (
+                    "hidpp_battery_0",
+                    &[("type", "Battery"), ("scope", "Device"), ("capacity", "5")],
+                ),
+            ],
+        );
+        let battery = battery_in(&root).expect("a battery");
+        assert_eq!((battery.percent, battery.on_ac), (73, true));
+        assert_eq!(battery_power_in(&root), None, "charging, not discharging");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_discharging_battery_meters_the_machine() {
+        let root = fake_supplies(
+            "discharging",
+            &[(
+                "BAT0",
+                &[
+                    ("type", "Battery"),
+                    ("energy_now", "30000000"),
+                    ("energy_full", "60000000"),
+                    ("status", "Discharging"),
+                    ("current_now", "-1500000"),
+                    ("voltage_now", "12000000"),
+                ],
+            )],
+        );
+        let battery = battery_in(&root).expect("a battery");
+        assert_eq!((battery.percent, battery.on_ac), (50, false));
+        assert_eq!(battery_power_in(&root), Some(18.0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_machine_without_a_battery_has_none() {
+        let root = fake_supplies(
+            "mains-only",
+            &[("AC", &[("type", "Mains"), ("online", "1")])],
+        );
+        assert!(battery_in(&root).is_none());
+        assert_eq!(battery_power_in(&root), None);
+        let _ = fs::remove_dir_all(root);
     }
 }

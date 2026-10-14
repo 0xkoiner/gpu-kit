@@ -1,13 +1,21 @@
+//! Interface byte counters from /proc/net/dev; rates come from deltas.
+
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::path::Path;
 use std::time::Instant;
 
+use crate::files;
 use crate::rate::{ByteCounts, ByteRates};
 use crate::snapshot::Throughput;
-use crate::sys::{self, ifmibdata};
 
-/// 64-bit byte counters of each interface that carries its own traffic;
-/// rates come from deltas.
+const NET: &str = "/sys/class/net";
+
+/// `IFF_LOOPBACK` and `IFF_POINTOPOINT` from <net/if.h>, as `flags` prints them.
+const IFF_LOOPBACK: u64 = 0x8;
+const IFF_POINTOPOINT: u64 = 0x10;
+
+/// Byte counters of each interface that carries its own traffic; rates come
+/// from deltas.
 #[derive(Default)]
 pub struct NetworkCounters {
     rates: ByteRates<String>,
@@ -15,121 +23,201 @@ pub struct NetworkCounters {
 
 impl NetworkCounters {
     /// `read` is received bytes per second, `write` is sent. `None` on the
-    /// first call, which only sets the baseline, and when the read fails.
+    /// first call, which only sets the baseline, when the read fails, and
+    /// when no interface carries its own traffic.
     pub fn sample(&mut self) -> Option<Throughput> {
         self.rates.sample(Instant::now(), read_interfaces())
     }
 }
 
-/// Counters of each interface by name, so interfaces coming and going
-/// (USB adapters, Thunderbolt docks) don't net against the others' traffic.
-///
-/// Read from `net.link.generic.ifalldata`, not `NET_RT_IFLIST2`: for a
-/// non-Apple binary that one rounds the byte counters to 1 KiB and truncates
-/// them to 32 bits, so they wrap every 4 GiB.
+/// Counters of each interface by name, so interfaces coming and going (USB
+/// adapters, containers' veth ends) don't net against the others' traffic.
+/// `None` when /proc/net/dev can't be read, and when no interface carries
+/// its own traffic, so a rate of zero is a quiet network, not a missing one.
 fn read_interfaces() -> Option<HashMap<String, ByteCounts>> {
-    let mut mib = [
-        sys::CTL_NET,
-        sys::PF_LINK,
-        sys::NETLINK_GENERIC,
-        sys::IFMIB_IFALLDATA,
-        0,
-        sys::IFDATA_GENERAL,
-    ];
-    parse_interfaces(&sys::sysctl_table(&mut mib)?)
+    let counts = parse_counts(&files::read("/proc/net/dev")?);
+    let interfaces = own_traffic(counts, |name| describe(Path::new(NET), name));
+    (!interfaces.is_empty()).then_some(interfaces)
 }
 
-/// Parses a table of `struct ifmibdata`. `None` if it isn't whole records,
-/// as then its layout isn't the one the offsets describe.
-fn parse_interfaces(table: &[u8]) -> Option<HashMap<String, ByteCounts>> {
-    if !table.len().is_multiple_of(ifmibdata::SIZE) {
-        return None;
-    }
-    let interfaces = table
-        .chunks_exact(ifmibdata::SIZE)
-        .filter_map(|record| {
-            let name = &record[ifmibdata::NAME..ifmibdata::NAME + ifmibdata::NAME_LEN];
-            let name = CStr::from_bytes_until_nul(name).ok()?.to_str().ok()?;
+/// `(name, counts)` of every interface in /proc/net/dev, whose two header
+/// lines are followed by `name: rx_bytes rx_packets ... tx_bytes ...`, the
+/// transmit bytes being the ninth number.
+fn parse_counts(dev: &str) -> Vec<(String, ByteCounts)> {
+    dev.lines()
+        .filter_map(|line| {
+            let (name, fields) = line.split_once(':')?;
+            let fields: Vec<&str> = fields.split_whitespace().collect();
             let counts = ByteCounts {
-                read: sys::read_u64(record, ifmibdata::IBYTES),
-                written: sys::read_u64(record, ifmibdata::OBYTES),
+                read: fields.first()?.parse().ok()?,
+                written: fields.get(8)?.parse().ok()?,
             };
-            carries_own_traffic(name, record).then(|| (name.to_owned(), counts))
+            Some((name.trim().to_owned(), counts))
         })
-        .collect();
-    Some(interfaces)
+        .collect()
 }
 
-/// Whether an interface's traffic is counted on it alone. Loopback never
-/// leaves the Mac. Tunnels (utun, ipsec, ppp) carry traffic the link under
-/// them counts again, encapsulated; bridges, VLANs and link aggregates count
-/// what their member links already do; and a VM's `vmenet` end either stays
-/// on the Mac or is forwarded through a physical link. An empty name is an
-/// interface still attaching or already detaching.
-fn carries_own_traffic(name: &str, record: &[u8]) -> bool {
-    let flags = sys::read_u32(record, ifmibdata::FLAGS);
-    let layered = matches!(
-        record[ifmibdata::TYPE],
-        sys::IFT_BRIDGE | sys::IFT_L2VLAN | sys::IFT_IEEE8023ADLAG
-    );
-    !name.is_empty()
-        && flags & (sys::IFF_LOOPBACK | sys::IFF_POINTOPOINT) == 0
-        && !layered
-        && !name.starts_with("vmenet")
+/// What sysfs says of an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Link {
+    loopback: bool,
+    point_to_point: bool,
+    /// Backed by a device (a NIC, or a VM's virtual one), not by other links.
+    physical: bool,
+}
+
+fn describe(net: &Path, name: &str) -> Link {
+    let dir = net.join(name);
+    let flags = files::read(dir.join("flags"))
+        .and_then(|flags| u64::from_str_radix(flags.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    Link {
+        loopback: flags & IFF_LOOPBACK != 0,
+        point_to_point: flags & IFF_POINTOPOINT != 0,
+        physical: dir.join("device").exists(),
+    }
+}
+
+/// The interfaces whose traffic is counted on them alone. Loopback never
+/// leaves the machine. Tunnels (point-to-point: tun, ppp, WireGuard) carry
+/// traffic the link under them counts again, encapsulated. Of the rest, only
+/// those backed by a device count: a bridge, bond, VLAN, macvlan or veth end
+/// moves what a physical link already counts. A machine without any such
+/// device, such as a container whose network is one veth end, counts every
+/// remaining interface instead: those are its network.
+fn own_traffic(
+    counts: Vec<(String, ByteCounts)>,
+    describe: impl Fn(&str) -> Link,
+) -> HashMap<String, ByteCounts> {
+    let links: Vec<(String, ByteCounts, Link)> = counts
+        .into_iter()
+        .map(|(name, counts)| {
+            let link = describe(&name);
+            (name, counts, link)
+        })
+        .filter(|(_, _, link)| !link.loopback && !link.point_to_point)
+        .collect();
+    let any_physical = links.iter().any(|(_, _, link)| link.physical);
+    links
+        .into_iter()
+        .filter(|(_, _, link)| link.physical || !any_physical)
+        .map(|(name, counts, _)| (name, counts))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `IFF_UP`, `IFT_ETHER` and `IFT_OTHER`.
-    const UP: u32 = 0x1;
-    const ETHER: u8 = 0x6;
-    const OTHER: u8 = 0x1;
-
-    fn record(name: &str, flags: u32, kind: u8, read: u64, written: u64) -> Vec<u8> {
-        let mut record = vec![0; ifmibdata::SIZE];
-        record[ifmibdata::NAME..][..name.len()].copy_from_slice(name.as_bytes());
-        record[ifmibdata::FLAGS..][..4].copy_from_slice(&flags.to_ne_bytes());
-        record[ifmibdata::TYPE] = kind;
-        record[ifmibdata::IBYTES..][..8].copy_from_slice(&read.to_ne_bytes());
-        record[ifmibdata::OBYTES..][..8].copy_from_slice(&written.to_ne_bytes());
-        record
-    }
+    const DEV: &str = "Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:  351447     649    0    0    0     0          0         0   351447     649    0    0    0     0       0          0
+  eth0: 5767584   35889    0    6    0     0          0         0 35816579   36167    0    0    0     0       0          0
+";
 
     #[test]
-    fn counters_past_4_gib_read_whole() {
-        // `NET_RT_IFLIST2` would hand these to us truncated to 32 bits.
-        let table = record("en0", UP, ETHER, 5_000_000_000, 6_000_000_000);
-        let en0 = parse_interfaces(&table).expect("whole records")["en0"];
-        assert_eq!((en0.read, en0.written), (5_000_000_000, 6_000_000_000));
+    fn received_and_sent_bytes_are_read_per_interface() {
+        let counts = parse_counts(DEV);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[1].0, "eth0");
+        assert_eq!(
+            (counts[1].1.read, counts[1].1.written),
+            (5_767_584, 35_816_579)
+        );
     }
+
+    fn links<'a>(table: &'a [(&'a str, Link)]) -> impl Fn(&str) -> Link + 'a {
+        move |name| {
+            table
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, link)| *link)
+                .expect("a known interface")
+        }
+    }
+
+    fn counts(names: &[&str]) -> Vec<(String, ByteCounts)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), ByteCounts::default()))
+            .collect()
+    }
+
+    fn sorted(interfaces: HashMap<String, ByteCounts>) -> Vec<String> {
+        let mut names: Vec<String> = interfaces.into_keys().collect();
+        names.sort();
+        names
+    }
+
+    const PHYSICAL: Link = Link {
+        loopback: false,
+        point_to_point: false,
+        physical: true,
+    };
+    const VIRTUAL: Link = Link {
+        physical: false,
+        ..PHYSICAL
+    };
 
     #[test]
     fn traffic_counted_on_another_interface_is_skipped() {
         let table = [
-            record("en0", UP, ETHER, 1, 1),
-            record("awdl0", UP, ETHER, 1, 1),
-            record("lo0", UP | sys::IFF_LOOPBACK, sys::IFT_LOOP, 1, 1),
-            record("utun3", UP | sys::IFF_POINTOPOINT, OTHER, 1, 1),
-            record("bridge0", UP, sys::IFT_BRIDGE, 1, 1),
-            record("vlan0", UP, sys::IFT_L2VLAN, 1, 1),
-            record("bond0", UP, sys::IFT_IEEE8023ADLAG, 1, 1),
-            record("vmenet0", UP, ETHER, 1, 1),
-            // An interface mid-attach or detach comes back zeroed.
-            vec![0; ifmibdata::SIZE],
-        ]
-        .concat();
-        let interfaces = parse_interfaces(&table).expect("whole records");
-        let mut names: Vec<_> = interfaces.keys().map(String::as_str).collect();
-        names.sort();
-        assert_eq!(names, ["awdl0", "en0"]);
+            (
+                "lo",
+                Link {
+                    loopback: true,
+                    ..VIRTUAL
+                },
+            ),
+            ("ens5", PHYSICAL),
+            ("wlan0", PHYSICAL),
+            (
+                "wg0",
+                Link {
+                    point_to_point: true,
+                    ..VIRTUAL
+                },
+            ),
+            ("docker0", VIRTUAL),
+            ("veth1a2b", VIRTUAL),
+            ("bond0", VIRTUAL),
+        ];
+        let names: Vec<&str> = table.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            sorted(own_traffic(counts(&names), links(&table))),
+            ["ens5", "wlan0"]
+        );
     }
 
     #[test]
-    fn a_table_of_partial_records_is_refused() {
-        let mut table = record("en0", UP, ETHER, 1, 1);
-        table.pop();
-        assert!(parse_interfaces(&table).is_none());
+    fn a_container_counts_its_virtual_interfaces() {
+        let table = [
+            (
+                "lo",
+                Link {
+                    loopback: true,
+                    ..VIRTUAL
+                },
+            ),
+            ("eth0", VIRTUAL),
+            (
+                "tun0",
+                Link {
+                    point_to_point: true,
+                    ..VIRTUAL
+                },
+            ),
+        ];
+        assert_eq!(
+            sorted(own_traffic(counts(&["lo", "eth0", "tun0"]), links(&table))),
+            ["eth0"]
+        );
+    }
+
+    #[test]
+    fn this_machine_has_an_interface_with_its_own_traffic() {
+        let interfaces = read_interfaces().expect("/proc/net/dev");
+        assert!(!interfaces.is_empty());
+        assert!(!interfaces.contains_key("lo"));
     }
 }

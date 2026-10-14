@@ -327,6 +327,7 @@ pub const SIGKILL: c_int = 9;
 pub const EPERM: c_int = 1;
 pub const ESRCH: c_int = 3;
 pub const EINVAL: c_int = 22;
+pub const ERANGE: c_int = 34;
 
 unsafe extern "C" {
     pub fn getpwuid_r(

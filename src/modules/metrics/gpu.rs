@@ -29,8 +29,9 @@ pub struct GpuSample {
     /// The hottest GPU, in °C.
     pub celsius: Option<f32>,
     /// Each process's share of GPU time by pid, 0–100: the most it took of
-    /// any one GPU. `None` where the driver doesn't report it (amdgpu, and
-    /// NVML on some GPUs); an empty map where no process used a GPU.
+    /// any one GPU. `Some` only when every GPU reports it, so a process on
+    /// one that doesn't (amdgpu, some NVML devices) is never shown idle; an
+    /// empty map where no process used a GPU.
     pub process_shares: Option<HashMap<i32, f32>>,
 }
 

@@ -538,10 +538,11 @@ fn the_process_baseline_is_not_cut_short_by_a_second_guard() {
 }
 
 #[test]
-fn a_guard_gone_before_it_is_seen_takes_no_sample() {
+fn a_wake_with_no_guard_behind_it_takes_no_sample() {
     let tracker = tracker(MAX_INTERVAL);
     let updates = tracker.subscribe();
-    let _ = tracker.demand_processes();
+    // What a guard taken and dropped before the thread looks leaves behind.
+    tracker.shared.wake();
     assert!(
         matches!(
             updates.recv_timeout(Duration::from_secs(1)),
@@ -550,4 +551,39 @@ fn a_guard_gone_before_it_is_seen_takes_no_sample() {
         "a wake that changes nothing is not a tick"
     );
     assert!(tracker.is_alive());
+}
+
+#[test]
+fn a_guard_released_before_it_is_seen_ends_listing_at_the_scheduled_tick() {
+    let tracker = tracker(MAX_INTERVAL);
+    let updates = tracker.subscribe();
+    let first = tracker.demand_processes();
+    assert!(next(&updates).snapshot().processes.is_some());
+    drop(first);
+    let second = tracker.demand_processes();
+    drop(second);
+    assert!(
+        matches!(
+            updates.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "listing ends with the scheduled sample, not with an extra one"
+    );
+    tracker.set_interval(MIN_INTERVAL);
+    assert!(next(&updates).snapshot().processes.is_none());
+}
+
+#[test]
+fn subscribing_after_the_thread_has_ended_disconnects_at_once() {
+    let tracker = tracker(MAX_INTERVAL);
+    tracker.stop();
+    let late = tracker.subscribe();
+    assert!(
+        matches!(
+            late.recv_timeout(PATIENCE),
+            Err(RecvTimeoutError::Disconnected)
+        ),
+        "a receiver born after the thread ended must not wait for it"
+    );
+    assert_eq!(tracker.subscriber_count(), 0);
 }

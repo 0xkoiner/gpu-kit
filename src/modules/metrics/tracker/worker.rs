@@ -28,7 +28,15 @@ pub(crate) struct Shared {
     /// Live [`ProcessDemand`](super::ProcessDemand) guards.
     demand: AtomicUsize,
     latest: Mutex<Option<Arc<Reading>>>,
-    subscribers: Mutex<Vec<SyncSender<Arc<Reading>>>>,
+    subscribers: Mutex<Subscribers>,
+}
+
+/// The queues readings are offered to. Once the thread has ended the list is
+/// closed: a late subscriber's sender is dropped at once, so its receiver is
+/// born disconnected instead of waiting on a thread that will never publish.
+struct Subscribers {
+    senders: Vec<SyncSender<Arc<Reading>>>,
+    closed: bool,
 }
 
 /// The loop's settings, under one lock so a wait sees them together.
@@ -61,7 +69,10 @@ pub(crate) enum Wait {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Follow {
     Unchanged,
-    Changed,
+    /// Listing began, and the baseline span has been waited.
+    Started,
+    /// Listing ended; the next sample has no processes.
+    Ended,
     Stopped,
 }
 
@@ -81,7 +92,10 @@ impl Shared {
             wake: Condvar::new(),
             demand: AtomicUsize::new(0),
             latest: Mutex::new(None),
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: Mutex::new(Subscribers {
+                senders: Vec::new(),
+                closed: false,
+            }),
         }
     }
 
@@ -170,23 +184,27 @@ impl Shared {
         locked(&self.latest).clone()
     }
 
-    /// A queue of readings for one consumer, bounded at `UPDATE_QUEUE`.
+    /// A queue of readings for one consumer, bounded at `UPDATE_QUEUE`; one
+    /// that is already disconnected once the thread has ended.
     pub(crate) fn subscribe(&self) -> Receiver<Arc<Reading>> {
         let (sender, receiver) = sync_channel(UPDATE_QUEUE);
-        locked(&self.subscribers).push(sender);
+        let mut subscribers = locked(&self.subscribers);
+        if !subscribers.closed {
+            subscribers.senders.push(sender);
+        }
         receiver
     }
 
     #[cfg(test)]
     pub(crate) fn subscriber_count(&self) -> usize {
-        locked(&self.subscribers).len()
+        locked(&self.subscribers).senders.len()
     }
 
     /// Makes `reading` the latest and offers it to every subscriber without
     /// waiting: a full queue misses it, a closed one is forgotten.
     pub(crate) fn publish(&self, reading: Arc<Reading>) {
         *locked(&self.latest) = Some(Arc::clone(&reading));
-        locked(&self.subscribers).retain(|subscriber| {
+        locked(&self.subscribers).senders.retain(|subscriber| {
             !matches!(
                 subscriber.try_send(Arc::clone(&reading)),
                 Err(TrySendError::Disconnected(_))
@@ -196,8 +214,12 @@ impl Shared {
 }
 
 impl Drop for Exit<'_> {
+    /// Closes and clears under the one lock, so no subscriber can slip in
+    /// between.
     fn drop(&mut self) {
-        locked(&self.0.subscribers).clear();
+        let mut subscribers = locked(&self.0.subscribers);
+        subscribers.closed = true;
+        subscribers.senders.clear();
     }
 }
 
@@ -256,10 +278,10 @@ fn next_sample(sampler: &mut Sampler, shared: &Shared, tick: &mut Instant) -> Op
         }
         match follow_demand(sampler, shared) {
             Follow::Stopped => return None,
-            // The guard behind a wake went away before it was seen: nothing
-            // changed, so the tick goes on where it was.
-            Follow::Unchanged if ended == Wait::Woken => continue,
-            Follow::Unchanged | Follow::Changed => {}
+            // The guard behind a wake is gone, whether or not listing had
+            // begun: the tick goes on where it was, over a full interval.
+            Follow::Unchanged | Follow::Ended if ended == Wait::Woken => continue,
+            Follow::Unchanged | Follow::Started | Follow::Ended => {}
         }
         *tick = Instant::now();
         return Some(sampler.sample());
@@ -274,8 +296,12 @@ fn follow_demand(sampler: &mut Sampler, shared: &Shared) -> Follow {
         return Follow::Unchanged;
     }
     sampler.set_lists_processes(lists);
-    if lists && !shared.pause(PROCESS_BASELINE) {
-        return Follow::Stopped;
+    if !lists {
+        return Follow::Ended;
     }
-    Follow::Changed
+    if shared.pause(PROCESS_BASELINE) {
+        Follow::Started
+    } else {
+        Follow::Stopped
+    }
 }

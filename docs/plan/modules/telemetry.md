@@ -31,10 +31,10 @@ All items are re-exported from the module root (`lib.rs` here, `mod.rs` in Photo
 | `Tracker::start(config) -> io::Result<Tracker>` | Builds the `Sampler` on the caller's thread (loads the GPU library, opens RAPL, takes the rate baselines — a moment, so call it off a UI thread), then spawns the `telemetry-sampler` thread. `Err` only when the OS refuses a thread. |
 | `Tracker::chip(&self) -> &ChipInfo` | Static facts of the machine, known from `start`. |
 | `Tracker::latest(&self) -> Option<Arc<Reading>>` | The newest reading; `None` until the first interval has elapsed. A clone of an `Arc`, never of the data. |
-| `Tracker::subscribe(&self) -> mpsc::Receiver<Arc<Reading>>` | Every reading published from now on, in order, on a queue of `UPDATE_QUEUE`. A subscriber that falls that far behind misses readings rather than stalling the sampler; a dropped receiver is forgotten at the next publish; every receiver disconnects when the thread ends (`stop`, `Drop`, or a panic), so a `recv` never blocks on a dead tracker. |
+| `Tracker::subscribe(&self) -> mpsc::Receiver<Arc<Reading>>` | Every reading published from now on, in order, on a queue of `UPDATE_QUEUE`. A subscriber that falls that far behind misses readings rather than stalling the sampler; a dropped receiver is forgotten at the next publish; every receiver disconnects when the thread ends (`stop`, `Drop`, or a panic) and one taken afterwards is born disconnected, so a `recv` never blocks on a dead tracker. |
 | `Tracker::interval(&self) -> Duration` / `set_interval(&self, Duration)` | The wait between samples. A change applies at once: the wait in progress moves its deadline (shortening a 1 h wait to 1 s delivers within 1 s), without taking an extra sample. |
 | `Tracker::is_frozen(&self) -> bool` / `set_frozen(&self, bool)` | Frozen, the thread keeps sampling so rates stay fresh, but publishes nothing: `latest`, history, peaks and `sequence` stand still until thawed. |
-| `Tracker::demand_processes(&self) -> ProcessDemand` | Processes are listed (the most expensive part of a sample) only while at least one guard lives; the guard is `#[must_use]`. The first guard wakes the thread at once; it records the process baseline, waits a full `PROCESS_BASELINE` (only `stop` cuts that wait), then samples. A wake whose guard is gone before the thread sees it changes nothing and takes no sample. When the last guard drops, the next reading has `processes: None`. |
+| `Tracker::demand_processes(&self) -> ProcessDemand` | Processes are listed (the most expensive part of a sample) only while at least one guard lives; the guard is `#[must_use]`. The first guard wakes the thread at once; it records the process baseline, waits a full `PROCESS_BASELINE` (only `stop` cuts that wait), then samples. A wake whose guard is gone before the thread sees it takes no sample, whether or not listing had begun: the tick goes on where it was. When the last guard drops, the next scheduled reading has `processes: None`. |
 | `Tracker::lists_processes(&self) -> bool` | Whether a guard is alive. |
 | `Tracker::is_alive(&self) -> bool` | Whether the sampling thread is still running. |
 | `Tracker::stop(&self)` | Signals the thread and joins it; `is_alive()` is false afterwards. Callable through an `Arc`. `Drop` only signals; the thread then exits within one wait. |
@@ -43,6 +43,8 @@ All items are re-exported from the module root (`lib.rs` here, `mod.rs` in Photo
 | `Series` | `new(capacity)` · `push(Option<f32>)` (drops the oldest at capacity) · `values() -> impl Iterator<Item = Option<f32>>` oldest first · `latest()` · `max()` and `mean()` over the window's present values · `peak()` the largest value ever pushed, which outlives the window · `len()` · `capacity()` · `is_empty()`. |
 | `Metric` | `Cpu`, `Gpu`, `Memory`, `Power`, `NetworkReceive`, `NetworkSend`, `DiskRead`, `DiskWrite` · `ALL` · `read(self, &Snapshot) -> Option<f32>` · `unit(self) -> Unit` · `label(self) -> &'static str`. |
 | `Unit` | `Percent` (0–100), `Watts`, `BytesPerSecond`. |
+
+Per-process GPU shares (`Process.gpu`) are `Some` only when every GPU answered NVML's process-utilization query; a process on a GPU that can't answer is never shown idle.
 
 `Metric::read` is the one place a snapshot turns into a chart value: CPU is `Cpu::usage()`, GPU is `gpu.usage`, memory is `used / total × 100` (`None` when `total` is 0 or memory unread), power is `Power::total()`, the four rates are `Throughput`'s fields as `f32`.
 
@@ -68,18 +70,17 @@ loop:
     ended = wait_tick(tick)             — until tick + interval (re-read on every change); early on stop or wake
     if ended == Stop: break
     lists = demand_count > 0
-    if lists == sampler.lists_processes():
-        if ended == Woken: continue     — the guard behind the wake is gone; the tick goes on where it was
-    else:
+    if lists != sampler.lists_processes():
         sampler.set_lists_processes(lists)
         if lists and not pause(PROCESS_BASELINE): break   — a full span; only stop cuts it
+    if ended == Woken and not lists: continue   — the guard behind the wake is gone; the tick goes on where it was
     tick = now
     snapshot = sampler.sample()
     if frozen: continue                 — the sample kept the rate baselines fresh; nothing else
     history.push(&snapshot); sequence += 1
     publish(Arc::new(Reading::new(sequence, snapshot, history.clone(), busiest_len)))
                                         — latest = reading; each subscriber: try_send, keep on Full, forget on Disconnected
-on exit (return or panic): subscribers.clear()   — every receiver disconnects
+on exit (return or panic): subscribers.close()   — every receiver disconnects; a later subscribe is born disconnected
 ```
 
 The waits are one `Condvar` on the control block. `set_interval` notifies it, so the deadline moves at once; `wake` (the first demand) and `stop` end a tick's wait early; the baseline `pause` heeds `stop` alone, so a second guard arriving during it can't shorten the span process rates are measured over.

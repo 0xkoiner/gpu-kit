@@ -9,5 +9,5 @@
 **Status:** done
 
 - [x] Test: at `MAX_INTERVAL`, guard A, 60 ms, drop A, guard B: the reading with processes arrives no earlier than `PROCESS_BASELINE` after A.
-- [x] Test: `let _ = tracker.demand_processes();` at `MAX_INTERVAL` produces no reading within 1 s and the thread stays alive.
+- [x] Test: a wake with no guard behind it (`shared.wake()`, what a guard taken and dropped before the thread looks leaves) at `MAX_INTERVAL` produces no reading within 1 s and the thread stays alive (round 2 made it deterministic).
 - [x] Component + module + system suites green. Hand-off: `fix(telemetry): a second guard can't cut the process baseline short`.

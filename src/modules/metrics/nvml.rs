@@ -172,7 +172,7 @@ impl Nvml {
     }
 
     /// Each GPU's readings, and every process's share of GPU time since the
-    /// last call. `None` shares where the driver doesn't report process
+    /// last call. `None` shares unless every GPU reports process
     /// utilization; an empty map where no process used a GPU.
     pub fn sample(&mut self) -> (Vec<DeviceSample>, Option<HashMap<i32, f32>>) {
         let devices = self
@@ -185,22 +185,21 @@ impl Nvml {
     }
 
     /// Every process's share of GPU time since the last call: the most it
-    /// took of any one GPU. `None` when no GPU reports process utilization.
+    /// took of any one GPU. `None` unless every GPU reports process
+    /// utilization, as a process on one that doesn't would otherwise look
+    /// idle.
     fn sample_shares(&mut self) -> Option<HashMap<i32, f32>> {
         let mut newest = self.last_seen;
-        let mut merged: Option<HashMap<i32, f32>> = None;
+        let mut merged = HashMap::new();
+        let mut every_device_answered = !self.devices.is_empty();
         for &device in &self.devices {
-            let Some(shares) = self.process_shares(device, self.last_seen, &mut newest) else {
-                continue;
-            };
-            let merged = merged.get_or_insert_with(HashMap::new);
-            for (pid, share) in shares {
-                let most = merged.entry(pid).or_insert(0.0);
-                *most = most.max(share);
+            match self.process_shares(device, self.last_seen, &mut newest) {
+                Some(shares) => merge_most(&mut merged, shares),
+                None => every_device_answered = false,
             }
         }
         self.last_seen = newest;
-        merged
+        every_device_answered.then_some(merged)
     }
 
     fn device_sample(&self, device: Device) -> DeviceSample {
@@ -255,6 +254,15 @@ impl Nvml {
         }
         let filled = (filled as usize).min(samples.len());
         Some(mean_shares(samples.get(..filled).unwrap_or(&[]), newest))
+    }
+}
+
+/// Folds one GPU's shares into the whole: a process keeps the most it took
+/// of any one GPU.
+fn merge_most(into: &mut HashMap<i32, f32>, shares: HashMap<i32, f32>) {
+    for (pid, share) in shares {
+        let most = into.entry(pid).or_insert(0.0);
+        *most = most.max(share);
     }
 }
 

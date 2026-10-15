@@ -31,7 +31,7 @@
 
 ## Fixes
 
-`fixes_round_1/` records the independent review of the delivered set and the seven fixes it led to; `fixes_round_2/` the adversarial review of those fixes (three finders, two skeptics per finding) and the four it led to.
+`fixes_round_1/` records the independent review of the delivered set and the seven fixes it led to; `fixes_round_2/` the adversarial review of those fixes (three finders, two skeptics per finding) and the four it led to; `fixes_round_3/` the convergence check on round 2, which found no code defect and three record and test-strength items, closing the loop.
 
 ## Out of scope for this set
 

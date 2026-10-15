@@ -112,7 +112,9 @@ impl Tracker {
 
     /// Keeps processes listed while the guard lives. The first guard wakes
     /// the thread, which records a baseline, waits `PROCESS_BASELINE` and
-    /// samples; once the last guard drops, readings carry `processes: None`.
+    /// samples; one taken while the sampler still lists (within a tick of the
+    /// last listed reading, which `latest` holds) waits for the scheduled
+    /// tick. Once the last guard drops, readings carry `processes: None`.
     pub fn demand_processes(&self) -> ProcessDemand {
         if self.shared.add_demand() == 0 {
             self.shared.wake();

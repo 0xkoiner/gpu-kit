@@ -560,8 +560,8 @@ fn a_guard_released_before_it_is_seen_ends_listing_at_the_scheduled_tick() {
     let first = tracker.demand_processes();
     assert!(next(&updates).snapshot().processes.is_some());
     drop(first);
-    let second = tracker.demand_processes();
-    drop(second);
+    // What a guard taken and dropped before the thread looks leaves behind.
+    tracker.shared.wake();
     assert!(
         matches!(
             updates.recv_timeout(Duration::from_secs(1)),
@@ -571,6 +571,30 @@ fn a_guard_released_before_it_is_seen_ends_listing_at_the_scheduled_tick() {
     );
     tracker.set_interval(MIN_INTERVAL);
     assert!(next(&updates).snapshot().processes.is_none());
+}
+
+#[test]
+fn a_guard_taken_while_still_listing_waits_for_the_scheduled_tick() {
+    let tracker = tracker(MAX_INTERVAL);
+    let updates = tracker.subscribe();
+    let first = tracker.demand_processes();
+    assert!(next(&updates).snapshot().processes.is_some());
+    drop(first);
+    let _second = tracker.demand_processes();
+    assert!(
+        matches!(
+            updates.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "a listed reading already exists; the next comes with the tick"
+    );
+    assert!(
+        tracker
+            .latest()
+            .is_some_and(|latest| latest.snapshot().processes.is_some())
+    );
+    tracker.set_interval(MIN_INTERVAL);
+    assert!(next(&updates).snapshot().processes.is_some());
 }
 
 #[test]

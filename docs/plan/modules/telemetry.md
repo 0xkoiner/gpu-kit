@@ -34,7 +34,7 @@ All items are re-exported from the module root (`lib.rs` here, `mod.rs` in Photo
 | `Tracker::subscribe(&self) -> mpsc::Receiver<Arc<Reading>>` | Every reading published from now on, in order, on a queue of `UPDATE_QUEUE`. A subscriber that falls that far behind misses readings rather than stalling the sampler; a dropped receiver is forgotten at the next publish; every receiver disconnects when the thread ends (`stop`, `Drop`, or a panic) and one taken afterwards is born disconnected, so a `recv` never blocks on a dead tracker. |
 | `Tracker::interval(&self) -> Duration` / `set_interval(&self, Duration)` | The wait between samples. A change applies at once: the wait in progress moves its deadline (shortening a 1 h wait to 1 s delivers within 1 s), without taking an extra sample. |
 | `Tracker::is_frozen(&self) -> bool` / `set_frozen(&self, bool)` | Frozen, the thread keeps sampling so rates stay fresh, but publishes nothing: `latest`, history, peaks and `sequence` stand still until thawed. |
-| `Tracker::demand_processes(&self) -> ProcessDemand` | Processes are listed (the most expensive part of a sample) only while at least one guard lives; the guard is `#[must_use]`. The first guard wakes the thread at once; it records the process baseline, waits a full `PROCESS_BASELINE` (only `stop` cuts that wait), then samples. A wake whose guard is gone before the thread sees it takes no sample, whether or not listing had begun: the tick goes on where it was. When the last guard drops, the next scheduled reading has `processes: None`. |
+| `Tracker::demand_processes(&self) -> ProcessDemand` | Processes are listed (the most expensive part of a sample) only while at least one guard lives; the guard is `#[must_use]`. The first guard wakes the thread at once; it records the process baseline, waits a full `PROCESS_BASELINE` (only `stop` cuts that wait), then samples. A wake whose guard is gone before the thread sees it takes no sample, whether or not listing had begun, and neither does a guard taken while the sampler still lists (within a tick of the last listed reading, which `latest` holds): the tick goes on where it was. When the last guard drops, the next scheduled reading has `processes: None`. |
 | `Tracker::lists_processes(&self) -> bool` | Whether a guard is alive. |
 | `Tracker::is_alive(&self) -> bool` | Whether the sampling thread is still running. |
 | `Tracker::stop(&self)` | Signals the thread and joins it; `is_alive()` is false afterwards. Callable through an `Arc`. `Drop` only signals; the thread then exits within one wait. |
@@ -70,10 +70,14 @@ loop:
     ended = wait_tick(tick)             — until tick + interval (re-read on every change); early on stop or wake
     if ended == Stop: break
     lists = demand_count > 0
+    started = false
     if lists != sampler.lists_processes():
         sampler.set_lists_processes(lists)
-        if lists and not pause(PROCESS_BASELINE): break   — a full span; only stop cuts it
-    if ended == Woken and not lists: continue   — the guard behind the wake is gone; the tick goes on where it was
+        if lists:
+            if not pause(PROCESS_BASELINE): break   — a full span; only stop cuts it
+            started = true
+    if ended == Woken and not started: continue   — the wake changed nothing that needs a sample now
+                                                  (its guard is gone, or listing was already on)
     tick = now
     snapshot = sampler.sample()
     if frozen: continue                 — the sample kept the rate baselines fresh; nothing else

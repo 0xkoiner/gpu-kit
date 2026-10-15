@@ -8,5 +8,5 @@
 
 **Status:** done
 
-- [x] Test: at `MAX_INTERVAL`, listed reading, drop A, take and drop B: no reading within 1 s; after `set_interval(MIN_INTERVAL)` the next reading has `processes: None`.
+- [x] Test: at `MAX_INTERVAL`, listed reading, drop A, then a wake with no guard behind it (`shared.wake()`, what a dropped-at-once B leaves): no reading within 1 s; after `set_interval(MIN_INTERVAL)` the next reading has `processes: None` (round 3 made it deterministic).
 - [x] Component + module + system suites green. Hand-off: `fix(telemetry): a stale wake never samples, whichever way listing moved`.

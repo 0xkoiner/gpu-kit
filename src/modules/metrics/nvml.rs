@@ -190,16 +190,13 @@ impl Nvml {
     /// idle.
     fn sample_shares(&mut self) -> Option<HashMap<i32, f32>> {
         let mut newest = self.last_seen;
-        let mut merged = HashMap::new();
-        let mut every_device_answered = !self.devices.is_empty();
-        for &device in &self.devices {
-            match self.process_shares(device, self.last_seen, &mut newest) {
-                Some(shares) => merge_most(&mut merged, shares),
-                None => every_device_answered = false,
-            }
-        }
+        let answers: Vec<Option<HashMap<i32, f32>>> = self
+            .devices
+            .iter()
+            .map(|&device| self.process_shares(device, self.last_seen, &mut newest))
+            .collect();
         self.last_seen = newest;
-        every_device_answered.then_some(merged)
+        merge_all(answers)
     }
 
     fn device_sample(&self, device: Device) -> DeviceSample {
@@ -257,13 +254,22 @@ impl Nvml {
     }
 }
 
-/// Folds one GPU's shares into the whole: a process keeps the most it took
-/// of any one GPU.
-fn merge_most(into: &mut HashMap<i32, f32>, shares: HashMap<i32, f32>) {
-    for (pid, share) in shares {
-        let most = into.entry(pid).or_insert(0.0);
-        *most = most.max(share);
+/// Every GPU's answer folded into one, a process keeping the most it took of
+/// any GPU. `None` when a GPU didn't answer, or there is none: a process on a
+/// GPU that can't report would otherwise look idle.
+fn merge_all(
+    answers: impl IntoIterator<Item = Option<HashMap<i32, f32>>>,
+) -> Option<HashMap<i32, f32>> {
+    let mut merged: HashMap<i32, f32> = HashMap::new();
+    let mut any_gpu = false;
+    for answer in answers {
+        for (pid, share) in answer? {
+            let most = merged.entry(pid).or_insert(0.0);
+            *most = most.max(share);
+        }
+        any_gpu = true;
     }
+    any_gpu.then_some(merged)
 }
 
 /// Each pid's mean SM share over its samples, 0–100; `newest` takes the
@@ -297,6 +303,28 @@ mod tests {
     #[test]
     fn a_missing_library_is_no_gpu() {
         assert!(Library::open(c"libtop-metrics-no-such-library.so").is_none());
+    }
+
+    #[test]
+    fn process_shares_need_every_gpu_to_answer() {
+        let busy = HashMap::from([(7, 40.0), (9, 10.0)]);
+        let busier = HashMap::from([(7, 60.0)]);
+        assert_eq!(
+            merge_all([Some(busy.clone()), Some(busier)]),
+            Some(HashMap::from([(7, 60.0), (9, 10.0)])),
+            "a process keeps the most it took of any GPU"
+        );
+        assert_eq!(
+            merge_all([Some(busy), None]),
+            None,
+            "a GPU that can't answer would hide its processes as idle"
+        );
+        assert_eq!(
+            merge_all([Some(HashMap::new()), Some(HashMap::new())]),
+            Some(HashMap::new()),
+            "idle GPUs are an answer"
+        );
+        assert_eq!(merge_all(Vec::new()), None, "no GPU is no answer");
     }
 
     #[test]

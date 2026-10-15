@@ -52,13 +52,13 @@ impl ProcessTable {
     }
 
     /// Every process, with its CPU use since the last sample and, from
-    /// `gpu_shares`, its share of the GPU. `None` when /proc can't be listed
-    /// or the boot time read; the baselines are kept, so the next sample
-    /// spans the gap.
+    /// `gpu_shares` when a driver reports them, its share of the GPU. `None`
+    /// when /proc can't be listed or the boot time read; the baselines are
+    /// kept, so the next sample spans the gap.
     pub fn sample(
         &mut self,
         memory_total: u64,
-        gpu_shares: &HashMap<i32, f32>,
+        gpu_shares: Option<&HashMap<i32, f32>>,
     ) -> Option<Vec<Process>> {
         let pids = pids(Path::new("/proc"))?;
         let boot_secs = boot_time()?;
@@ -103,7 +103,7 @@ impl ProcessTable {
                     user,
                     command: command(pid, &stat.comm),
                     cpu,
-                    gpu: gpu_shares.get(&pid).copied().unwrap_or(0.0),
+                    gpu: gpu_shares.map(|shares| shares.get(&pid).copied().unwrap_or(0.0)),
                     memory,
                     resident,
                     cpu_time: stat.cpu_ticks as f64 / self.clk_tck as f64,
@@ -339,7 +339,7 @@ mod tests {
     fn our_own_process_is_listed_and_running() {
         let mut table = ProcessTable::new();
         let me = std::process::id() as i32;
-        let first = table.sample(1 << 34, &HashMap::new()).expect("/proc");
+        let first = table.sample(1 << 34, None).expect("/proc");
         let process = first.iter().find(|p| p.pid == me).expect("ourselves");
         assert!(process.resident > 0 && process.memory > 0.0);
         assert!(!process.user.is_empty() && !process.command.is_empty());
@@ -352,7 +352,7 @@ mod tests {
         // Busy-wait a little so the second sample has CPU time to report.
         let spin = Instant::now();
         while spin.elapsed().as_millis() < 20 {}
-        let second = table.sample(1 << 34, &HashMap::new()).expect("/proc");
+        let second = table.sample(1 << 34, None).expect("/proc");
         let process = second.iter().find(|p| p.pid == me).expect("ourselves");
         assert!(process.cpu > 0.0, "{process:?}");
     }

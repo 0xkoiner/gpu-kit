@@ -200,9 +200,9 @@ pub struct Process {
     pub command: String,
     /// Share of one core, so a busy multi-threaded process can exceed 100.
     pub cpu: f32,
-    /// Share of the GPU's busy time, 0–100; only NVML reports it, so 0
-    /// elsewhere.
-    pub gpu: f32,
+    /// Share of the GPU's busy time, 0–100. `Some` only where a driver
+    /// reports per-process GPU time (NVML); `None` elsewhere.
+    pub gpu: Option<f32>,
     /// Resident memory as a share of physical memory, 0–100.
     pub memory: f32,
     pub resident: u64,

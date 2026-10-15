@@ -61,19 +61,12 @@ impl Reading {
 }
 
 /// Indices of the `count` processes with the highest CPU share, highest
-/// first. A NaN share ranks as idle, and an index is never trusted blindly.
+/// first.
 fn rank_busiest(processes: &[Process], count: usize) -> Vec<usize> {
     if count == 0 {
         return Vec::new();
     }
-    let share = |ix: &usize| {
-        processes
-            .get(*ix)
-            .map(|process| process.cpu)
-            .filter(|cpu| !cpu.is_nan())
-            .unwrap_or(0.0)
-    };
-    let by_share = |a: &usize, b: &usize| share(b).total_cmp(&share(a));
+    let by_share = |a: &usize, b: &usize| share(processes, *b).total_cmp(&share(processes, *a));
     let mut ranked: Vec<usize> = (0..processes.len()).collect();
     if ranked.len() > count {
         ranked.select_nth_unstable_by(count, by_share);
@@ -81,4 +74,14 @@ fn rank_busiest(processes: &[Process], count: usize) -> Vec<usize> {
     }
     ranked.sort_by(by_share);
     ranked
+}
+
+/// The CPU share of the process at `ix`; a NaN, or an index that isn't one,
+/// ranks as idle rather than panicking or sorting first.
+fn share(processes: &[Process], ix: usize) -> f32 {
+    processes
+        .get(ix)
+        .map(|process| process.cpu)
+        .filter(|cpu| !cpu.is_nan())
+        .unwrap_or(0.0)
 }

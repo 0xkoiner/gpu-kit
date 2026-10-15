@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 
+use super::types::constants::MAX_HISTORY_LEN;
 use super::types::enums::Metric;
 use super::types::structs::{History, Series};
 use crate::snapshot::Snapshot;
@@ -15,9 +16,10 @@ use crate::snapshot::Snapshot;
 /* .•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.• */
 
 impl Series {
-    /// An empty series that keeps the last `capacity` values, at least one.
+    /// An empty series that keeps the last `capacity` values, clamped to
+    /// `1..=MAX_HISTORY_LEN`.
     pub fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+        let capacity = capacity.clamp(1, MAX_HISTORY_LEN);
         Self {
             values: VecDeque::with_capacity(capacity),
             capacity,

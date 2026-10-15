@@ -53,7 +53,9 @@ impl Tracker {
     /// refuses a thread.
     pub fn start(config: TrackerConfig) -> io::Result<Self> {
         let config = config.normalized();
-        let sampler = Sampler::new();
+        let mut sampler = Sampler::new();
+        // Listing follows the demand guards, none of which exist yet.
+        sampler.set_lists_processes(false);
         let chip = sampler.chip().clone();
         let shared = Arc::new(Shared::new(config.interval));
         let worker = Arc::clone(&shared);
@@ -79,7 +81,8 @@ impl Tracker {
 
     /// Every reading published from now on, in order. A consumer that falls
     /// `UPDATE_QUEUE` readings behind misses some rather than stalling the
-    /// sampler; dropping the receiver unsubscribes.
+    /// sampler; dropping the receiver unsubscribes, and the receiver
+    /// disconnects once the tracker has stopped.
     pub fn subscribe(&self) -> Receiver<Arc<Reading>> {
         self.shared.subscribe()
     }
@@ -89,12 +92,13 @@ impl Tracker {
         self.shared.interval()
     }
 
-    /// Sets the wait, clamped to `MIN_INTERVAL..=MAX_INTERVAL`; it applies
-    /// from the next tick.
+    /// Sets the wait, clamped to `MIN_INTERVAL..=MAX_INTERVAL`. It applies at
+    /// once: the wait in progress moves its deadline.
     pub fn set_interval(&self, interval: Duration) {
         self.shared.set_interval(interval);
     }
 
+    /// Whether readings are being withheld; see [`Tracker::set_frozen`].
     pub fn is_frozen(&self) -> bool {
         self.shared.is_frozen()
     }

@@ -38,7 +38,9 @@ pub enum Metric {
 pub enum Unit {
     /// A share, 0–100.
     Percent,
+    /// Power draw.
     Watts,
+    /// A transfer rate.
     BytesPerSecond,
 }
 

@@ -27,14 +27,14 @@ All items are re-exported from the module root (`lib.rs` here, `mod.rs` in Photo
 
 | Item | Contract |
 |---|---|
-| `TrackerConfig { interval: Duration, history_len: usize, busiest_len: usize }` + `Default` | Defaults are the constants below. `interval` is clamped to `[MIN_INTERVAL, MAX_INTERVAL]`, `history_len` to at least 1; `busiest_len` may be 0. |
+| `TrackerConfig { interval: Duration, history_len: usize, busiest_len: usize }` + `Default` | Defaults are the constants below. `interval` is clamped to `[MIN_INTERVAL, MAX_INTERVAL]`, `history_len` to `[1, MAX_HISTORY_LEN]` (the history is cloned into every reading); `busiest_len` may be 0. |
 | `Tracker::start(config) -> io::Result<Tracker>` | Builds the `Sampler` on the caller's thread (loads the GPU library, opens RAPL, takes the rate baselines — a moment, so call it off a UI thread), then spawns the `telemetry-sampler` thread. `Err` only when the OS refuses a thread. |
 | `Tracker::chip(&self) -> &ChipInfo` | Static facts of the machine, known from `start`. |
 | `Tracker::latest(&self) -> Option<Arc<Reading>>` | The newest reading; `None` until the first interval has elapsed. A clone of an `Arc`, never of the data. |
-| `Tracker::subscribe(&self) -> mpsc::Receiver<Arc<Reading>>` | Every reading published from now on, in order, on a queue of `UPDATE_QUEUE`. A subscriber that falls that far behind misses readings rather than stalling the sampler; a dropped receiver is forgotten at the next publish. |
-| `Tracker::interval(&self) -> Duration` / `set_interval(&self, Duration)` | The wait between samples. A change applies from the next tick. |
+| `Tracker::subscribe(&self) -> mpsc::Receiver<Arc<Reading>>` | Every reading published from now on, in order, on a queue of `UPDATE_QUEUE`. A subscriber that falls that far behind misses readings rather than stalling the sampler; a dropped receiver is forgotten at the next publish; every receiver disconnects when the thread ends (`stop`, `Drop`, or a panic), so a `recv` never blocks on a dead tracker. |
+| `Tracker::interval(&self) -> Duration` / `set_interval(&self, Duration)` | The wait between samples. A change applies at once: the wait in progress moves its deadline (shortening a 1 h wait to 1 s delivers within 1 s), without taking an extra sample. |
 | `Tracker::is_frozen(&self) -> bool` / `set_frozen(&self, bool)` | Frozen, the thread keeps sampling so rates stay fresh, but publishes nothing: `latest`, history, peaks and `sequence` stand still until thawed. |
-| `Tracker::demand_processes(&self) -> ProcessDemand` | Processes are listed (the most expensive part of a sample) only while at least one guard lives. The first guard wakes the thread at once; it records the process baseline, waits `PROCESS_BASELINE`, then samples. When the last guard drops, the next reading has `processes: None`. |
+| `Tracker::demand_processes(&self) -> ProcessDemand` | Processes are listed (the most expensive part of a sample) only while at least one guard lives; the guard is `#[must_use]`. The first guard wakes the thread at once; it records the process baseline, waits a full `PROCESS_BASELINE` (only `stop` cuts that wait), then samples. A wake whose guard is gone before the thread sees it changes nothing and takes no sample. When the last guard drops, the next reading has `processes: None`. |
 | `Tracker::lists_processes(&self) -> bool` | Whether a guard is alive. |
 | `Tracker::is_alive(&self) -> bool` | Whether the sampling thread is still running. |
 | `Tracker::stop(&self)` | Signals the thread and joins it; `is_alive()` is false afterwards. Callable through an `Arc`. `Drop` only signals; the thread then exits within one wait. |
@@ -54,29 +54,35 @@ All items are re-exported from the module root (`lib.rs` here, `mod.rs` in Photo
 | `MIN_INTERVAL` | 100 ms | Below this /proc reads dominate the machine they measure. |
 | `MAX_INTERVAL` | 1 h | Keeps `Condvar::wait_timeout` arithmetic in range. |
 | `HISTORY_LEN` | 48 | top's sparkline width. |
+| `MAX_HISTORY_LEN` | 86 400 | A day at 1 s; the history is cloned into every reading, and `VecDeque::with_capacity` of more would abort the thread. |
 | `BUSIEST_LEN` | 5 | top's popover list. |
 | `PROCESS_BASELINE` | 250 ms | Process CPU rates need a span after listing resumes. |
 | `UPDATE_QUEUE` | 8 | Readings a subscriber may lag before it misses some. |
-| `THREAD_NAME` | `"telemetry-sampler"` | What `ps -L` and panics show. |
+| `THREAD_NAME` | `"metrics-sampler"` | What `ps -L` and panics show; 15 bytes, the most the kernel keeps of a thread name. |
 
 ## The loop (`tracker/worker.rs`)
 
 ```
+tick = now
 loop:
-    wait(interval)                      — ends early on stop, or when the first ProcessDemand opens
-    if stopping: break
+    ended = wait_tick(tick)             — until tick + interval (re-read on every change); early on stop or wake
+    if ended == Stop: break
     lists = demand_count > 0
-    if lists != sampler.lists_processes():
+    if lists == sampler.lists_processes():
+        if ended == Woken: continue     — the guard behind the wake is gone; the tick goes on where it was
+    else:
         sampler.set_lists_processes(lists)
-        if lists: wait(PROCESS_BASELINE)   — also ends early on stop
+        if lists and not pause(PROCESS_BASELINE): break   — a full span; only stop cuts it
+    tick = now
     snapshot = sampler.sample()
-    if frozen: continue                  — the sample kept the rate baselines fresh; nothing else
+    if frozen: continue                 — the sample kept the rate baselines fresh; nothing else
     history.push(&snapshot); sequence += 1
-    reading = Arc::new(Reading::new(sequence, snapshot, history.clone(), busiest_len))
-    publish(reading)                     — latest = reading; each subscriber: try_send, drop on Full, forget on Disconnected
+    publish(Arc::new(Reading::new(sequence, snapshot, history.clone(), busiest_len)))
+                                        — latest = reading; each subscriber: try_send, keep on Full, forget on Disconnected
+on exit (return or panic): subscribers.clear()   — every receiver disconnects
 ```
 
-The wait is one `Condvar` on the control block; wakes are explicit (`stop`, first demand). An interval change is read at the top of the next loop, so it takes effect within one old interval, as in top.
+The waits are one `Condvar` on the control block. `set_interval` notifies it, so the deadline moves at once; `wake` (the first demand) and `stop` end a tick's wait early; the baseline `pause` heeds `stop` alone, so a second guard arriving during it can't shorten the span process rates are measured over.
 
 ## Layout (`src/modules/metrics/tracker/`, Photon skeleton)
 
@@ -102,7 +108,7 @@ Existing files (`cpu.rs`, `process.rs`, `snapshot.rs`, …) keep their shape; re
 ## Tests
 
 - **Component** (`tracker/test/tests.rs`, pure): series window and peak, mean/max over gaps, `Metric::read` for each metric and each `None` path, busiest ranking (20 processes → the five highest by CPU, descending; `processes: None` → empty; `busiest_len` 0 → empty; NaN doesn't panic), config clamping.
-- **Module** (same file, live, Linux): `Tracker::start` at `MIN_INTERVAL`: a subscriber receives sequence 1 within 5 s and `latest()` agrees; frozen for three intervals, `sequence` doesn't move, thaw and it does; `demand_processes` turns `processes` from `None` to `Some` within the next readings and back to `None` after the guard drops; `stop()` returns and `is_alive()` is false; a dropped subscriber doesn't stop the others.
+- **Module** (same file, live, Linux): `Tracker::start` at `MIN_INTERVAL`: a subscriber receives sequence 1 within 5 s and `latest()` agrees; frozen for three intervals, `sequence` doesn't move, thaw and it does; `demand_processes` turns `processes` from `None` to `Some` within the next readings and back to `None` after the guard drops; `stop()` returns, `is_alive()` is false and receivers disconnect; `Drop` lets the thread exit; a shorter interval applies to the wait in progress; a second guard during the baseline doesn't cut it; a guard gone before it is seen takes no sample; a dropped subscriber doesn't stop the others.
 - **System** (`cargo run -- --watch 500`): one JSON line per reading with sequence, timestamp, every metric's value, peak and mean, and the busiest processes; `cargo run` alone still writes the one-shot `metrics.json`.
 
 ## Out of scope

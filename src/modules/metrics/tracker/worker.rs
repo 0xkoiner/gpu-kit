@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use super::types::constants::{MAX_INTERVAL, MIN_INTERVAL, PROCESS_BASELINE, UPDATE_QUEUE};
 use super::types::structs::{History, Reading, TrackerConfig};
 use crate::Sampler;
+use crate::snapshot::Snapshot;
 
 /* ´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*: */
 /*                           Structs                            */
@@ -35,20 +36,33 @@ struct Control {
     interval: Duration,
     frozen: bool,
     stopping: bool,
-    /// Set by the first demand; the next wait returns at once and clears it.
+    /// Set by the first demand; the next tick's wait returns at once and
+    /// clears it.
     woken: bool,
 }
+
+/// Clears the subscriber list when the loop ends, panic included, so a
+/// `recv` on a stopped tracker returns `Disconnected` instead of blocking.
+struct Exit<'a>(&'a Shared);
 
 /* ´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*: */
 /*                            Enums                             */
 /* .•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.• */
 
-/// Why a wait ended.
+/// Why a tick's wait ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wait {
     Elapsed,
     Woken,
     Stop,
+}
+
+/// What following the demand for processes did to the sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    Unchanged,
+    Changed,
+    Stopped,
 }
 
 /* ´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*: */
@@ -75,9 +89,11 @@ impl Shared {
         locked(&self.control).interval
     }
 
-    /// Clamped into range; the loop reads it at its next top.
+    /// Clamped into range and applied at once: a tick's wait in progress
+    /// moves its deadline.
     pub(crate) fn set_interval(&self, interval: Duration) {
         locked(&self.control).interval = interval.clamp(MIN_INTERVAL, MAX_INTERVAL);
+        self.wake.notify_all();
     }
 
     pub(crate) fn is_frozen(&self) -> bool {
@@ -94,17 +110,15 @@ impl Shared {
         self.wake.notify_all();
     }
 
-    /// Ends the current wait early, once.
+    /// Ends the current tick's wait early, once.
     pub(crate) fn wake(&self) {
         locked(&self.control).woken = true;
         self.wake.notify_all();
     }
 
-    /// Sleeps `duration`, or less when stopped or woken meanwhile.
-    pub(crate) fn wait(&self, duration: Duration) -> Wait {
-        let Some(deadline) = Instant::now().checked_add(duration) else {
-            return Wait::Elapsed;
-        };
+    /// Sleeps until `tick` plus the interval, re-read whenever it changes;
+    /// or less, when stopped or woken meanwhile.
+    pub(crate) fn wait_tick(&self, tick: Instant) -> Wait {
         let mut control = locked(&self.control);
         loop {
             if control.stopping {
@@ -114,10 +128,25 @@ impl Shared {
                 control.woken = false;
                 return Wait::Woken;
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            let Some(left) = remaining(tick, control.interval) else {
                 return Wait::Elapsed;
+            };
+            control = wait_on(&self.wake, control, left);
+        }
+    }
+
+    /// Sleeps `duration`, or until stopped: `false` then. A wake doesn't cut
+    /// it short, so a baseline span is always a full one.
+    pub(crate) fn pause(&self, duration: Duration) -> bool {
+        let started = Instant::now();
+        let mut control = locked(&self.control);
+        loop {
+            if control.stopping {
+                return false;
             }
+            let Some(left) = remaining(started, duration) else {
+                return true;
+            };
             control = wait_on(&self.wake, control, left);
         }
     }
@@ -166,6 +195,12 @@ impl Shared {
     }
 }
 
+impl Drop for Exit<'_> {
+    fn drop(&mut self) {
+        locked(&self.0.subscribers).clear();
+    }
+}
+
 /// A lock's data, poisoned or not: a panic elsewhere must not take the
 /// telemetry down with it.
 pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -184,16 +219,23 @@ fn wait_on<'a>(
         .0
 }
 
+/// What is left of `duration` after `since`; `None` once it has run out,
+/// and when the deadline can't be represented at all.
+fn remaining(since: Instant, duration: Duration) -> Option<Duration> {
+    since
+        .checked_add(duration)?
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+}
+
 /// The sampling loop, for as long as the tracker lives. Frozen, it samples
 /// (so the rate baselines stay fresh) and publishes nothing.
 pub(crate) fn run(mut sampler: Sampler, shared: Arc<Shared>, config: TrackerConfig) {
+    let _exit = Exit(&shared);
     let mut history = History::new(config.history_len);
     let mut sequence = 0u64;
-    loop {
-        if shared.wait(shared.interval()) == Wait::Stop || !follow_demand(&mut sampler, &shared) {
-            break;
-        }
-        let snapshot = sampler.sample();
+    let mut tick = Instant::now();
+    while let Some(snapshot) = next_sample(&mut sampler, &shared, &mut tick) {
         if shared.is_frozen() {
             continue;
         }
@@ -204,13 +246,36 @@ pub(crate) fn run(mut sampler: Sampler, shared: Arc<Shared>, config: TrackerConf
     }
 }
 
+/// Waits out the tick, follows the demand for processes and takes the next
+/// sample, moving `tick` to its start. `None` once stopped.
+fn next_sample(sampler: &mut Sampler, shared: &Shared, tick: &mut Instant) -> Option<Snapshot> {
+    loop {
+        let ended = shared.wait_tick(*tick);
+        if ended == Wait::Stop {
+            return None;
+        }
+        match follow_demand(sampler, shared) {
+            Follow::Stopped => return None,
+            // The guard behind a wake went away before it was seen: nothing
+            // changed, so the tick goes on where it was.
+            Follow::Unchanged if ended == Wait::Woken => continue,
+            Follow::Unchanged | Follow::Changed => {}
+        }
+        *tick = Instant::now();
+        return Some(sampler.sample());
+    }
+}
+
 /// Starts or stops listing processes to match the demand, giving process
-/// rates a baseline span when starting. `false` when stopped meanwhile.
-fn follow_demand(sampler: &mut Sampler, shared: &Shared) -> bool {
+/// rates a baseline span when starting.
+fn follow_demand(sampler: &mut Sampler, shared: &Shared) -> Follow {
     let lists = shared.demand() > 0;
     if lists == sampler.lists_processes() {
-        return true;
+        return Follow::Unchanged;
     }
     sampler.set_lists_processes(lists);
-    !(lists && shared.wait(PROCESS_BASELINE) == Wait::Stop)
+    if lists && !shared.pause(PROCESS_BASELINE) {
+        return Follow::Stopped;
+    }
+    Follow::Changed
 }

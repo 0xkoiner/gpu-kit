@@ -3,10 +3,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::types::constants::{MAX_INTERVAL, MIN_INTERVAL, UPDATE_QUEUE};
+use super::types::constants::{
+    MAX_HISTORY_LEN, MAX_INTERVAL, MIN_INTERVAL, PROCESS_BASELINE, UPDATE_QUEUE,
+};
 use super::{History, Metric, Reading, Series, Tracker, TrackerConfig, Unit};
 use crate::snapshot::{
     CoreKind, CoreUsage, Cpu, Gpu, Memory, Power, Process, Snapshot, Throughput,
@@ -97,6 +99,19 @@ fn mean_and_max_skip_gaps_and_an_all_gap_window_has_neither() {
         Series::new(0).capacity(),
         1,
         "a window holds at least one value"
+    );
+}
+
+#[test]
+fn a_nan_first_value_leaves_no_peak() {
+    let mut series = series_of(2, &[Some(f32::NAN)]);
+    assert_eq!(series.peak(), None);
+    series.push(Some(3.0));
+    assert_eq!(series.peak(), Some(3.0));
+    assert_eq!(
+        Series::new(usize::MAX).capacity(),
+        MAX_HISTORY_LEN,
+        "a window never asks for more memory than a day of samples"
     );
 }
 
@@ -458,8 +473,81 @@ fn a_dropped_receiver_is_forgotten_at_the_next_publish() {
     let kept = tracker.subscribe();
     assert_eq!(tracker.subscriber_count(), 2);
     drop(dropped);
-    // A publish already under way may have offered to both; the next one can't.
-    let _ = next(&kept);
-    let _ = next(&kept);
+    // A reading numbered past what is latest now was published after the drop.
+    let held = tracker.latest().map_or(0, |latest| latest.sequence());
+    next_where(&kept, |reading| reading.sequence() > held);
     assert_eq!(tracker.subscriber_count(), 1);
+}
+
+#[test]
+fn subscribers_disconnect_once_the_tracker_has_stopped() {
+    let tracker = tracker(MAX_INTERVAL);
+    let updates = tracker.subscribe();
+    tracker.stop();
+    assert!(
+        matches!(
+            updates.recv_timeout(PATIENCE),
+            Err(RecvTimeoutError::Disconnected)
+        ),
+        "a receiver on a stopped tracker must not block forever"
+    );
+}
+
+#[test]
+fn dropping_a_tracker_lets_its_thread_exit() {
+    let tracker = tracker(MAX_INTERVAL);
+    let shared = Arc::downgrade(&tracker.shared);
+    drop(tracker);
+    let deadline = Instant::now() + PATIENCE;
+    while shared.strong_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the thread still holds the shared block"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_shorter_interval_applies_to_the_wait_in_progress() {
+    let tracker = tracker(MAX_INTERVAL);
+    let updates = tracker.subscribe();
+    let begun = Instant::now();
+    tracker.set_interval(MIN_INTERVAL);
+    let first = next(&updates);
+    assert_eq!(first.sequence(), 1);
+    assert!(begun.elapsed() < PATIENCE);
+}
+
+#[test]
+fn the_process_baseline_is_not_cut_short_by_a_second_guard() {
+    let tracker = tracker(MAX_INTERVAL);
+    let updates = tracker.subscribe();
+    let begun = Instant::now();
+    let first = tracker.demand_processes();
+    std::thread::sleep(Duration::from_millis(60));
+    drop(first);
+    let _second = tracker.demand_processes();
+    let reading = next(&updates);
+    assert!(
+        begun.elapsed() >= PROCESS_BASELINE,
+        "sampled {:?} after the baseline was recorded",
+        begun.elapsed()
+    );
+    assert!(reading.snapshot().processes.is_some());
+}
+
+#[test]
+fn a_guard_gone_before_it_is_seen_takes_no_sample() {
+    let tracker = tracker(MAX_INTERVAL);
+    let updates = tracker.subscribe();
+    let _ = tracker.demand_processes();
+    assert!(
+        matches!(
+            updates.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "a wake that changes nothing is not a tick"
+    );
+    assert!(tracker.is_alive());
 }

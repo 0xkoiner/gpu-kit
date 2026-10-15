@@ -14,6 +14,9 @@ type Device = *mut c_void;
 
 /// `nvmlReturn_t` values.
 const SUCCESS: c_uint = 0;
+/// What `nvmlDeviceGetProcessUtilization` answers when no process has used
+/// the GPU since the time asked about.
+const NOT_FOUND: c_uint = 6;
 const INSUFFICIENT_SIZE: c_uint = 7;
 /// `nvmlClockType_t`: the SM (shader) clock.
 const CLOCK_SM: c_uint = 1;
@@ -177,26 +180,27 @@ impl Nvml {
             .iter()
             .map(|&device| self.device_sample(device))
             .collect();
-        let shares = self
-            .process_utilization
-            .is_some()
-            .then(|| self.sample_shares());
+        let shares = self.sample_shares();
         (devices, shares)
     }
 
     /// Every process's share of GPU time since the last call: the most it
-    /// took of any one GPU.
-    fn sample_shares(&mut self) -> HashMap<i32, f32> {
+    /// took of any one GPU. `None` when no GPU reports process utilization.
+    fn sample_shares(&mut self) -> Option<HashMap<i32, f32>> {
         let mut newest = self.last_seen;
-        let mut shares: HashMap<i32, f32> = HashMap::new();
+        let mut merged: Option<HashMap<i32, f32>> = None;
         for &device in &self.devices {
-            for (pid, share) in self.process_shares(device, self.last_seen, &mut newest) {
-                let most = shares.entry(pid).or_insert(0.0);
+            let Some(shares) = self.process_shares(device, self.last_seen, &mut newest) else {
+                continue;
+            };
+            let merged = merged.get_or_insert_with(HashMap::new);
+            for (pid, share) in shares {
+                let most = merged.entry(pid).or_insert(0.0);
                 *most = most.max(share);
             }
         }
         self.last_seen = newest;
-        shares
+        merged
     }
 
     fn device_sample(&self, device: Device) -> DeviceSample {
@@ -223,41 +227,52 @@ impl Nvml {
 
     /// Each process's share of `device`'s time since `last_seen`, 0–100: its
     /// mean SM use over the driver's samples of it. `newest` takes the latest
-    /// sample's timestamp.
+    /// sample's timestamp. `None` where the device doesn't answer (a GPU that
+    /// doesn't support the query, or a failed read), so an unknown share is
+    /// never reported as none.
     fn process_shares(
         &self,
         device: Device,
         last_seen: c_ulonglong,
         newest: &mut c_ulonglong,
-    ) -> HashMap<i32, f32> {
-        let Some(read) = self.process_utilization else {
-            return HashMap::new();
-        };
+    ) -> Option<HashMap<i32, f32>> {
+        let read = self.process_utilization?;
         let mut count: c_uint = 0;
-        // Asked without a buffer, the call says how many samples there are.
+        // Asked without a buffer, the call says how many samples there are,
+        // or NOT_FOUND for none, which is an answer too.
         let probe = unsafe { read(device, ptr::null_mut(), &mut count, last_seen) };
-        if !matches!(probe, SUCCESS | INSUFFICIENT_SIZE) || count == 0 {
-            return HashMap::new();
+        if probe == NOT_FOUND || (matches!(probe, SUCCESS | INSUFFICIENT_SIZE) && count == 0) {
+            return Some(HashMap::new());
+        }
+        if !matches!(probe, SUCCESS | INSUFFICIENT_SIZE) {
+            return None;
         }
         // Room for processes that start between the two calls.
         let mut samples = vec![ProcessSample::default(); (count as usize).min(4096) + 16];
         let mut filled = samples.len() as c_uint;
         if unsafe { read(device, samples.as_mut_ptr(), &mut filled, last_seen) } != SUCCESS {
-            return HashMap::new();
+            return None;
         }
-        let mut sums: HashMap<i32, (f32, u32)> = HashMap::new();
-        for sample in &samples[..(filled as usize).min(samples.len())] {
-            *newest = (*newest).max(sample.timestamp);
-            if let Ok(pid) = i32::try_from(sample.pid) {
-                let (sum, samples) = sums.entry(pid).or_default();
-                *sum += sample.sm.min(100) as f32;
-                *samples += 1;
-            }
-        }
-        sums.into_iter()
-            .map(|(pid, (sum, samples))| (pid, sum / samples as f32))
-            .collect()
+        let filled = (filled as usize).min(samples.len());
+        Some(mean_shares(samples.get(..filled).unwrap_or(&[]), newest))
     }
+}
+
+/// Each pid's mean SM share over its samples, 0–100; `newest` takes the
+/// latest sample's timestamp.
+fn mean_shares(samples: &[ProcessSample], newest: &mut c_ulonglong) -> HashMap<i32, f32> {
+    let mut sums: HashMap<i32, (f32, u32)> = HashMap::new();
+    for sample in samples {
+        *newest = (*newest).max(sample.timestamp);
+        if let Ok(pid) = i32::try_from(sample.pid) {
+            let (sum, count) = sums.entry(pid).or_default();
+            *sum += sample.sm.min(100) as f32;
+            *count += 1;
+        }
+    }
+    sums.into_iter()
+        .map(|(pid, (sum, count))| (pid, sum / count as f32))
+        .collect()
 }
 
 impl Drop for Nvml {

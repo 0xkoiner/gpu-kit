@@ -10,7 +10,7 @@
 3. **Gaps are `None`:** every series is `VecDeque<Option<f32>>`. No chart value is ever invented; `max`/`mean` skip gaps and are themselves `None` over an all-gap window.
 4. **Peak lives in the series:** `Series::peak` is the largest value ever pushed, so the "Peak" a power table shows survives the value leaving the 48-sample window (top's `power_peak`). It is not reset by freeze.
 5. **No indexing in the ranking:** `Reading::new` compares `processes.get(i).map_or(0.0, |p| p.cpu)` with `total_cmp` and `busiest()` yields `filter_map(get)`, so a malformed index can't panic (lint wall).
-6. **One control block, one `Condvar`:** `worker::Shared` holds `Mutex<Control { interval, frozen, stopping, woken }>`, the demand `AtomicUsize`, `latest`, and the subscriber list. The thread's `wait` returns early only on `stop` and on the first `ProcessDemand`; an interval change is read at the next loop top.
+6. **One control block, one `Condvar`:** `worker::Shared` holds `Mutex<Control { interval, frozen, stopping, woken }>`, the demand `AtomicUsize`, `latest`, and the subscriber list. A tick's wait ends early on `stop` and on the first `ProcessDemand`, and re-reads the interval whenever `set_interval` notifies; the baseline `pause` ends early on `stop` alone (fixes round 1).
 7. **The host decides the life of the thread:** `stop(self)` joins; `Drop` signals without joining so a UI dropping its tracker never blocks. Poisoned locks yield their data (`unwrap_or_else(PoisonError::into_inner)`) rather than fail the host.
 8. **Per-process GPU share is `Option`** (ticket 06): `Some` only when NVML reports process utilization; AMD and VMs give `None`, matching rule 1 of the plan. `GpuSample::process_shares` becomes `Option<HashMap<i32, f32>>` so the sampler can tell "no process used the GPU" from "nobody reports it".
 9. **`--watch` is the system test, not a product:** `main.rs` keeps the one-shot dump as the default and adds streaming behind `--watch [ms]`; both compose their JSON with `serde_json::json!` from the public accessors, so `Reading` needs no `Serialize`.
@@ -29,6 +29,10 @@
 
 01 and 06 start immediately. 02 after 01; 03 after 02; 04 and 05 after 03 and in parallel; 07 closes the set.
 
+## Fixes
+
+`fixes_round_1/` records the independent review of the delivered set and the seven fixes it led to.
+
 ## Out of scope for this set
 
 Reshaping the sampler files (`cpu.rs`, `process.rs`, …) to the module skeleton (banners, `types/`, `test/tests.rs`) · a Photon `telemetry` cargo feature and the `modules/mod.rs` gate · emitting readings as Photon metrics (the Product's `gauge!` calls read a `Reading`) · process control policy (SIGTERM→SIGKILL grace) · formatting (`"1.2 GB/s"`, `"≈2 %"`) · macOS.
@@ -39,7 +43,7 @@ Reshaping the sampler files (`cpu.rs`, `process.rs`, …) to the module skeleton
 cp -r gpu-kit/src/modules/metrics photon/src/modules/telemetry
 mv photon/src/modules/telemetry/lib.rs photon/src/modules/telemetry/mod.rs
 # drop the Cargo.toml copied along; the crate attribute moves to the module decl
-sed -i 's/crate::/crate::modules::telemetry::/g' photon/src/modules/telemetry/**/*.rs
-sed -i 's/#\[cfg_attr(feature = "serde", derive(serde::Serialize))\]/#[derive(serde::Serialize)]/' photon/src/modules/telemetry/**/*.rs
+find photon/src/modules/telemetry -name '*.rs' -exec sed -i 's/crate::/crate::modules::telemetry::/g' {} +
+find photon/src/modules/telemetry -name '*.rs' -exec sed -i 's/#\[cfg_attr(feature = "serde", derive(serde::Serialize))\]/#[derive(serde::Serialize)]/' {} +
 # modules/mod.rs:  #[cfg(all(feature = "telemetry", target_os = "linux"))] pub mod telemetry;
 ```

@@ -10,7 +10,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use super::constants::{BUSIEST_LEN, DEFAULT_INTERVAL, HISTORY_LEN, MAX_INTERVAL, MIN_INTERVAL};
+use super::constants::{
+    BUSIEST_LEN, DEFAULT_INTERVAL, HISTORY_LEN, MAX_HISTORY_LEN, MAX_INTERVAL, MIN_INTERVAL,
+};
 use crate::snapshot::Snapshot;
 use crate::tracker::worker::Shared;
 
@@ -24,7 +26,8 @@ use crate::tracker::worker::Shared;
 pub struct TrackerConfig {
     /// The wait between samples, clamped to `MIN_INTERVAL..=MAX_INTERVAL`.
     pub interval: Duration,
-    /// Samples each series keeps, at least 1.
+    /// Samples each series keeps, clamped to `1..=MAX_HISTORY_LEN`. The
+    /// history is cloned into every reading, so keep it to what a chart draws.
     pub history_len: usize,
     /// Processes a reading ranks by CPU; 0 ranks none.
     pub busiest_len: usize,
@@ -71,6 +74,7 @@ pub struct Reading {
 
 /// Keeps processes listed while alive; see
 /// [`Tracker::demand_processes`](crate::tracker::Tracker::demand_processes).
+#[must_use = "processes are listed only while the guard lives"]
 pub struct ProcessDemand(pub(crate) Arc<Shared>);
 
 /* ´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*: */
@@ -92,7 +96,7 @@ impl TrackerConfig {
     pub(crate) fn normalized(self) -> Self {
         Self {
             interval: self.interval.clamp(MIN_INTERVAL, MAX_INTERVAL),
-            history_len: self.history_len.max(1),
+            history_len: self.history_len.clamp(1, MAX_HISTORY_LEN),
             busiest_len: self.busiest_len,
         }
     }

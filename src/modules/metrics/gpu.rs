@@ -29,8 +29,9 @@ pub struct GpuSample {
     /// The hottest GPU, in °C.
     pub celsius: Option<f32>,
     /// Each process's share of GPU time by pid, 0–100: the most it took of
-    /// any one GPU. Only NVML reports it.
-    pub process_shares: HashMap<i32, f32>,
+    /// any one GPU. `None` where the driver doesn't report it (amdgpu, and
+    /// NVML on some GPUs); an empty map where no process used a GPU.
+    pub process_shares: Option<HashMap<i32, f32>>,
 }
 
 pub enum Gpus {
@@ -62,16 +63,16 @@ impl Gpus {
     pub fn sample(&mut self) -> Option<GpuSample> {
         let (devices, process_shares) = match self {
             Self::Nvidia(nvml) => nvml.sample(),
-            Self::Amd(cards) => (
-                cards.iter().map(amdgpu::Card::sample).collect(),
-                HashMap::new(),
-            ),
+            Self::Amd(cards) => (cards.iter().map(amdgpu::Card::sample).collect(), None),
         };
         aggregate(&devices, process_shares)
     }
 }
 
-fn aggregate(devices: &[DeviceSample], process_shares: HashMap<i32, f32>) -> Option<GpuSample> {
+fn aggregate(
+    devices: &[DeviceSample],
+    process_shares: Option<HashMap<i32, f32>>,
+) -> Option<GpuSample> {
     let usage: Vec<f32> = devices.iter().filter_map(|device| device.usage).collect();
     if usage.is_empty() {
         return None;
@@ -114,11 +115,18 @@ mod tests {
                 celsius: Some(70.0),
             },
         ];
-        let sample = aggregate(&devices, HashMap::new()).expect("busy GPUs");
+        let sample = aggregate(&devices, None).expect("busy GPUs");
         assert_eq!(sample.usage, 60.0);
         assert_eq!(sample.mhz, Some(1600));
         assert_eq!(sample.watts, None, "one GPU's power is unknown");
         assert_eq!(sample.celsius, Some(70.0));
+        assert_eq!(
+            sample.process_shares, None,
+            "amdgpu reports no process shares"
+        );
+        // NVML with no process on the GPU: known, and nobody.
+        let idle = aggregate(&devices, Some(HashMap::new())).expect("busy GPUs");
+        assert_eq!(idle.process_shares, Some(HashMap::new()));
     }
 
     #[test]
@@ -127,7 +135,7 @@ mod tests {
             mhz: Some(1500),
             ..DeviceSample::default()
         }];
-        assert!(aggregate(&devices, HashMap::new()).is_none());
-        assert!(aggregate(&[], HashMap::new()).is_none());
+        assert!(aggregate(&devices, None).is_none());
+        assert!(aggregate(&[], None).is_none());
     }
 }

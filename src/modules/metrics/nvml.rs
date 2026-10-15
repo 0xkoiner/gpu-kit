@@ -169,13 +169,24 @@ impl Nvml {
     }
 
     /// Each GPU's readings, and every process's share of GPU time since the
-    /// last call: the most it took of any one GPU.
-    pub fn sample(&mut self) -> (Vec<DeviceSample>, HashMap<i32, f32>) {
+    /// last call. `None` shares where the driver doesn't report process
+    /// utilization; an empty map where no process used a GPU.
+    pub fn sample(&mut self) -> (Vec<DeviceSample>, Option<HashMap<i32, f32>>) {
         let devices = self
             .devices
             .iter()
             .map(|&device| self.device_sample(device))
             .collect();
+        let shares = self
+            .process_utilization
+            .is_some()
+            .then(|| self.sample_shares());
+        (devices, shares)
+    }
+
+    /// Every process's share of GPU time since the last call: the most it
+    /// took of any one GPU.
+    fn sample_shares(&mut self) -> HashMap<i32, f32> {
         let mut newest = self.last_seen;
         let mut shares: HashMap<i32, f32> = HashMap::new();
         for &device in &self.devices {
@@ -185,7 +196,7 @@ impl Nvml {
             }
         }
         self.last_seen = newest;
-        (devices, shares)
+        shares
     }
 
     fn device_sample(&self, device: Device) -> DeviceSample {

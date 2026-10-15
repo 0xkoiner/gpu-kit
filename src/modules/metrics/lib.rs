@@ -3,6 +3,9 @@
 //! No crate dependencies (the `serde` feature adds `Serialize` to the snapshot
 //! types) and no root, apart from RAPL's energy counters, which recent kernels
 //! open to root alone. A metric the machine doesn't provide is `None`.
+//!
+//! [`Sampler`] takes one [`Snapshot`] per call; [`Tracker`] runs it on a
+//! background thread and publishes a [`Reading`] with history after each.
 #![cfg(target_os = "linux")]
 
 mod amdgpu;
@@ -20,12 +23,12 @@ mod snapshot;
 mod sys;
 mod system;
 mod thermal;
+pub mod tracker;
 mod volumes;
-
-use std::collections::HashMap;
 
 pub use process::{Signal, SignalError, is_running, send_signal};
 pub use snapshot::*;
+pub use tracker::{History, Metric, ProcessDemand, Reading, Series, Tracker, TrackerConfig, Unit};
 
 /// Owns every counter whose rate needs a previous reading. Rates cover the
 /// time between two `sample` calls, so the first call has none (`None`);
@@ -75,8 +78,7 @@ impl Sampler {
     /// their CPU rates, so wait a moment before the next `sample`.
     pub fn set_lists_processes(&mut self, lists: bool) {
         if lists && !self.lists_processes {
-            self.processes
-                .sample(self.chip.memory_bytes, &HashMap::new());
+            self.processes.sample(self.chip.memory_bytes, None);
         }
         self.lists_processes = lists;
     }
@@ -96,8 +98,7 @@ impl Sampler {
             dram: energy.dram,
             system: energy.system.or_else(system::battery_power),
         };
-        let no_shares = HashMap::new();
-        let gpu_shares = gpu.as_ref().map_or(&no_shares, |gpu| &gpu.process_shares);
+        let gpu_shares = gpu.as_ref().and_then(|gpu| gpu.process_shares.as_ref());
 
         Snapshot {
             cpu: Cpu {
@@ -149,11 +150,14 @@ mod tests {
         );
         assert!(snapshot.memory.is_some_and(|memory| memory.total > 0));
         assert!(snapshot.uptime_secs > 0);
-        assert!(
-            snapshot
-                .processes
-                .is_some_and(|processes| !processes.is_empty())
-        );
+        let processes = snapshot.processes.expect("/proc is listed");
+        assert!(!processes.is_empty());
+        if sampler.gpus.is_none() {
+            assert!(
+                processes.iter().all(|process| process.gpu.is_none()),
+                "without a GPU driver no process has a known GPU share"
+            );
+        }
         assert!(
             snapshot.network.is_some(),
             "the baseline was taken in new()"
